@@ -21,6 +21,11 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+try:
+    import yaml
+except ImportError:  # pragma: no cover - exercised only when optional dependency is absent
+    yaml = None
+
 DEFAULT_PORTS = (
     "21,22,23,25,53,67,68,80,110,123,135,137,138,139,143,161,162,389,443,"
     "445,465,500,515,548,587,631,993,995,1433,1883,3306,3389,4500,5000,"
@@ -28,6 +33,12 @@ DEFAULT_PORTS = (
     "9090,9100"
 )
 MAX_PREFIX_WITHOUT_CONFIRMATION = 16
+NO_OPEN_PORT_NOTE = "Hôte actif, aucun port ouvert dans la liste scannée."
+RFC1918_NETWORKS = (
+    ipaddress.IPv4Network("10.0.0.0/8"),
+    ipaddress.IPv4Network("172.16.0.0/12"),
+    ipaddress.IPv4Network("192.168.0.0/16"),
+)
 
 
 @dataclass
@@ -43,6 +54,11 @@ class Device:
     services: list[str] = field(default_factory=list)
     device_type: str = ""
     notes: str = ""
+    role: str = ""
+    vmid: str = ""
+    ctid: str = ""
+    bridges: list[str] = field(default_factory=list)
+    interfaces: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -66,6 +82,69 @@ class IpConflict:
     samples: list[str]
     severity: str
     notes: str
+    conflict_type: str = "same_ip_multiple_macs"
+
+
+@dataclass(frozen=True)
+class AutoDetectedInterface:
+    source: str
+    ip_address: str
+    prefix_length: int | None
+    interface_alias: str = ""
+    status: str = ""
+    network: str = ""
+    accepted: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class KnownInterface:
+    name: str = ""
+    ip: str = ""
+    network: str = ""
+    mac: str = ""
+    bridge: str = ""
+
+
+@dataclass(frozen=True)
+class KnownNode:
+    name: str
+    role: str = ""
+    ips: list[str] = field(default_factory=list)
+    networks: list[str] = field(default_factory=list)
+    macs: list[str] = field(default_factory=list)
+    vmid: str = ""
+    ctid: str = ""
+    bridges: list[str] = field(default_factory=list)
+    interfaces: list[KnownInterface] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class KnownBridge:
+    name: str
+    role: str = "bridge"
+    networks: list[str] = field(default_factory=list)
+    interfaces: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class KnownTopology:
+    nodes: list[KnownNode] = field(default_factory=list)
+    bridges: list[KnownBridge] = field(default_factory=list)
+    networks: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class VulnerabilityFinding:
+    ip: str
+    host: str
+    port: str
+    service: str
+    severity: str
+    title: str
+    evidence: str
+    recommendation: str
+    source: str
 
 
 def run_command(
@@ -131,15 +210,187 @@ def is_local_scan_network(net: ipaddress.IPv4Network) -> bool:
     )
 
 
-def detect_local_networks(timeout: int = 30) -> list[str]:
+def is_rfc1918_address(ip: ipaddress.IPv4Address) -> bool:
+    return any(ip in network for network in RFC1918_NETWORKS)
+
+
+def is_rfc1918_network(net: ipaddress.IPv4Network) -> bool:
+    return any(net.subnet_of(network) for network in RFC1918_NETWORKS)
+
+
+def detect_local_networks(timeout: int = 30, *, debug_auto: bool = False) -> list[str]:
     if platform.system().lower() == "windows":
-        return detect_windows_networks(timeout=timeout)
+        return detect_windows_networks(timeout=timeout, debug_auto=debug_auto)
     return detect_unix_networks(timeout=timeout)
 
 
-def detect_windows_networks(timeout: int = 30) -> list[str]:
+def detect_windows_networks(timeout: int = 30, *, debug_auto: bool = False) -> list[str]:
+    try:
+        interfaces = detect_windows_powershell_interfaces(timeout=timeout)
+        networks = networks_from_auto_interfaces(interfaces)
+        if debug_auto:
+            print_auto_detection_debug("PowerShell Get-NetIPAddress", interfaces, networks)
+        return networks
+    except (OSError, RuntimeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        if debug_auto:
+            print(f"[DEBUG auto] PowerShell Get-NetIPAddress en échec : {exc}")
+
     proc = run_command(["ipconfig", "/all"], timeout=timeout)
-    return parse_windows_ipconfig_networks(proc.stdout)
+    networks = parse_windows_ipconfig_networks(proc.stdout)
+    if debug_auto:
+        print("[DEBUG auto] Fallback ipconfig /all")
+        for network in networks:
+            print(f"[DEBUG auto]  réseau retenu : {network}")
+        if not networks:
+            print("[DEBUG auto]  aucun réseau retenu")
+    return networks
+
+
+def windows_powershell_ipaddress_command() -> list[str]:
+    ps_executable = shutil.which("powershell") or shutil.which("pwsh") or "powershell"
+    script = (
+        "$ErrorActionPreference='Stop'; "
+        "$hasGetNetAdapter = [bool](Get-Command Get-NetAdapter -ErrorAction SilentlyContinue); "
+        "Get-NetIPAddress -AddressFamily IPv4 | "
+        "Select-Object IPAddress,PrefixLength,InterfaceAlias,AddressState,"
+        "@{Name='InterfaceOperationalStatus';Expression={"
+        "if ($hasGetNetAdapter) { "
+        "(Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue).Status "
+        "} else { $null }"
+        "}} | ConvertTo-Json -Depth 3"
+    )
+    return [ps_executable, "-NoProfile", "-NonInteractive", "-Command", script]
+
+
+def detect_windows_powershell_interfaces(timeout: int = 30) -> list[AutoDetectedInterface]:
+    proc = run_command(windows_powershell_ipaddress_command(), timeout=timeout)
+    if proc.returncode != 0:
+        error = proc.stderr.strip() or f"code retour {proc.returncode}"
+        raise RuntimeError(error)
+    return parse_windows_powershell_interfaces(proc.stdout)
+
+
+def parse_windows_powershell_networks(text: str) -> list[str]:
+    return networks_from_auto_interfaces(parse_windows_powershell_interfaces(text))
+
+
+def parse_windows_powershell_interfaces(text: str) -> list[AutoDetectedInterface]:
+    raw = text.strip()
+    if not raw:
+        return []
+
+    data = json.loads(raw)
+    if data is None:
+        return []
+    if isinstance(data, dict):
+        records = [data]
+    elif isinstance(data, list):
+        records = data
+    else:
+        raise TypeError("JSON PowerShell inattendu")
+
+    interfaces: list[AutoDetectedInterface] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        interfaces.append(build_windows_powershell_interface(record))
+    return interfaces
+
+
+def build_windows_powershell_interface(record: dict[str, object]) -> AutoDetectedInterface:
+    lowered = {str(key).lower(): value for key, value in record.items()}
+    ip_value = str(lowered.get("ipaddress") or "").strip()
+    alias = str(lowered.get("interfacealias") or "").strip()
+    status = str(
+        lowered.get("interfaceoperationalstatus") or lowered.get("status") or lowered.get("addressstate") or ""
+    ).strip()
+    prefix_value = lowered.get("prefixlength")
+
+    try:
+        prefix = int(str(prefix_value).strip())
+    except (TypeError, ValueError):
+        return AutoDetectedInterface(
+            source="powershell",
+            ip_address=ip_value,
+            prefix_length=None,
+            interface_alias=alias,
+            status=status,
+            reason="préfixe IPv4 absent ou invalide",
+        )
+
+    try:
+        ip = ipaddress.IPv4Address(ip_value)
+        net = ipaddress.IPv4Network(f"{ip}/{prefix}", strict=False)
+    except ValueError as exc:
+        return AutoDetectedInterface(
+            source="powershell",
+            ip_address=ip_value,
+            prefix_length=prefix,
+            interface_alias=alias,
+            status=status,
+            reason=f"adresse IPv4 invalide : {exc}",
+        )
+
+    reason = accepted_auto_network_reason(ip, net, status)
+    return AutoDetectedInterface(
+        source="powershell",
+        ip_address=str(ip),
+        prefix_length=prefix,
+        interface_alias=alias,
+        status=status,
+        network=str(net),
+        accepted=reason == "",
+        reason=reason,
+    )
+
+
+def accepted_auto_network_reason(ip: ipaddress.IPv4Address, net: ipaddress.IPv4Network, status: str) -> str:
+    lowered_status = status.strip().lower()
+    if lowered_status in {"down", "disabled", "disconnected", "not present", "notpresent"}:
+        return "interface inactive"
+    if ip == ipaddress.IPv4Address("0.0.0.0"):
+        return "adresse non configurée"
+    if ip.is_loopback:
+        return "loopback ignoré"
+    if ip.is_link_local:
+        return "link-local ignoré"
+    if not is_rfc1918_address(ip):
+        return "adresse non RFC1918 ignorée"
+    if not is_local_scan_network(net):
+        return "réseau local non scannable"
+    if not is_rfc1918_network(net):
+        return "réseau non RFC1918 ignoré"
+    return ""
+
+
+def networks_from_auto_interfaces(interfaces: Iterable[AutoDetectedInterface]) -> list[str]:
+    return deduplicate(interface.network for interface in interfaces if interface.accepted and interface.network)
+
+
+def print_auto_detection_debug(
+    source: str,
+    interfaces: Iterable[AutoDetectedInterface],
+    networks: Iterable[str],
+) -> None:
+    print(f"[DEBUG auto] Source : {source}")
+    seen_interface = False
+    for interface in interfaces:
+        seen_interface = True
+        prefix = "" if interface.prefix_length is None else f"/{interface.prefix_length}"
+        status = f" status={interface.status}" if interface.status else ""
+        alias = f" alias={interface.interface_alias}" if interface.interface_alias else ""
+        decision = "retenue" if interface.accepted else f"ignorée ({interface.reason})"
+        network = f" réseau={interface.network}" if interface.network else ""
+        print(f"[DEBUG auto]  {interface.ip_address}{prefix}{alias}{status}{network} -> {decision}")
+    if not seen_interface:
+        print("[DEBUG auto]  aucune interface IPv4 détectée")
+
+    retained = list(networks)
+    if retained:
+        for network in retained:
+            print(f"[DEBUG auto]  réseau retenu : {network}")
+    else:
+        print("[DEBUG auto]  aucun réseau retenu")
 
 
 def parse_windows_ipconfig_networks(text: str) -> list[str]:
@@ -160,7 +411,7 @@ def parse_windows_ipconfig_networks(text: str) -> list[str]:
             try:
                 ip = ipaddress.IPv4Address(current_ip)
                 net = ipaddress.IPv4Network(f"{ip}/{mask_m.group(1)}", strict=False)
-                if ip.is_private and is_local_scan_network(net):
+                if is_rfc1918_address(ip) and is_local_scan_network(net) and is_rfc1918_network(net):
                     found.append(str(net))
             except ValueError:
                 pass
@@ -306,6 +557,288 @@ def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
+def as_string_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (int, float)):
+        return [str(value)]
+    if isinstance(value, list):
+        return [str(item) for item in value if item is not None]
+    return []
+
+
+def normalize_known_ip(value: str) -> tuple[str, str]:
+    raw = value.strip()
+    if not raw:
+        return "", ""
+    try:
+        if "/" in raw:
+            interface = ipaddress.IPv4Interface(raw)
+            return str(interface.ip), str(interface.network)
+        return str(ipaddress.IPv4Address(raw)), ""
+    except ValueError:
+        return "", ""
+
+
+def normalize_known_network(value: str) -> str:
+    try:
+        return str(ipaddress.IPv4Network(value.strip(), strict=False))
+    except ValueError:
+        return ""
+
+
+def records_from_yaml_section(section: object) -> list[dict[str, object]]:
+    if section is None:
+        return []
+    if isinstance(section, dict):
+        records: list[dict[str, object]] = []
+        for name, raw_record in section.items():
+            record = dict(raw_record) if isinstance(raw_record, dict) else {}
+            record.setdefault("name", str(name))
+            records.append(record)
+        return records
+    if isinstance(section, list):
+        return [dict(item) for item in section if isinstance(item, dict)]
+    return []
+
+
+def parse_known_interface(raw: object) -> KnownInterface | None:
+    if isinstance(raw, str):
+        return KnownInterface(name=raw)
+    if not isinstance(raw, dict):
+        return None
+
+    ip = ""
+    network = ""
+    for key in ("ip", "address"):
+        for value in as_string_list(raw.get(key)):
+            ip, network = normalize_known_ip(value)
+            if ip:
+                break
+        if ip:
+            break
+    explicit_networks = [
+        normalize_known_network(value) for value in as_string_list(raw.get("network") or raw.get("subnet"))
+    ]
+    explicit_networks = [value for value in explicit_networks if value]
+    return KnownInterface(
+        name=str(raw.get("name") or raw.get("interface") or raw.get("ifname") or "").strip(),
+        ip=ip,
+        network=network or (explicit_networks[0] if explicit_networks else ""),
+        mac=normalize_mac(str(raw.get("mac") or "")),
+        bridge=str(raw.get("bridge") or "").strip(),
+    )
+
+
+def parse_known_node(record: dict[str, object]) -> KnownNode:
+    ips: list[str] = []
+    networks: list[str] = []
+    for key in ("ip", "ips", "addresses"):
+        for value in as_string_list(record.get(key)):
+            ip, network = normalize_known_ip(value)
+            if ip:
+                ips.append(ip)
+            if network:
+                networks.append(network)
+    for key in ("network", "networks", "subnet", "subnets"):
+        parsed_networks = (normalize_known_network(value) for value in as_string_list(record.get(key)))
+        networks.extend(network for network in parsed_networks if network)
+
+    raw_interfaces = record.get("interfaces")
+    if isinstance(raw_interfaces, dict):
+        raw_interface_values: list[object] = []
+        for name, value in raw_interfaces.items():
+            if isinstance(value, dict):
+                item = dict(value)
+                item.setdefault("name", name)
+                raw_interface_values.append(item)
+            else:
+                raw_interface_values.append(str(name))
+    elif isinstance(raw_interfaces, list):
+        raw_interface_values = raw_interfaces
+    else:
+        raw_interface_values = []
+    parsed_interfaces = (parse_known_interface(item) for item in raw_interface_values)
+    interfaces = [interface for interface in parsed_interfaces if interface]
+
+    for interface in interfaces:
+        if interface.ip:
+            ips.append(interface.ip)
+        if interface.network:
+            networks.append(interface.network)
+
+    macs = [normalize_mac(value) for value in as_string_list(record.get("mac") or record.get("macs"))]
+    macs.extend(interface.mac for interface in interfaces if interface.mac)
+    bridges = as_string_list(record.get("bridge") or record.get("bridges"))
+    bridges.extend(interface.bridge for interface in interfaces if interface.bridge)
+
+    return KnownNode(
+        name=str(record.get("name") or "").strip(),
+        role=str(record.get("role") or record.get("type") or "").strip(),
+        ips=deduplicate(ips),
+        networks=deduplicate(networks),
+        macs=deduplicate(mac for mac in macs if mac),
+        vmid=str(record.get("vmid") or "").strip(),
+        ctid=str(record.get("ctid") or "").strip(),
+        bridges=deduplicate(bridge for bridge in bridges if bridge),
+        interfaces=interfaces,
+    )
+
+
+def parse_known_bridge(record: dict[str, object]) -> KnownBridge:
+    networks: list[str] = []
+    for key in ("network", "networks", "subnet", "subnets"):
+        parsed_networks = (normalize_known_network(value) for value in as_string_list(record.get(key)))
+        networks.extend(network for network in parsed_networks if network)
+    return KnownBridge(
+        name=str(record.get("name") or "").strip(),
+        role=str(record.get("role") or "bridge").strip() or "bridge",
+        networks=deduplicate(networks),
+        interfaces=deduplicate(as_string_list(record.get("interface") or record.get("interfaces"))),
+    )
+
+
+def parse_known_topology(data: object) -> KnownTopology:
+    if not isinstance(data, dict):
+        return KnownTopology()
+
+    node_records = records_from_yaml_section(data.get("nodes") or data.get("devices") or data.get("hosts"))
+    bridge_records = records_from_yaml_section(data.get("bridges"))
+    parsed_nodes = (parse_known_node(record) for record in node_records)
+    nodes = [node for node in parsed_nodes if node.name or node.ips or node.macs]
+    bridges = [bridge for bridge in (parse_known_bridge(record) for record in bridge_records) if bridge.name]
+
+    networks: list[str] = []
+    for key in ("network", "networks", "subnet", "subnets"):
+        parsed_networks = (normalize_known_network(value) for value in as_string_list(data.get(key)))
+        networks.extend(network for network in parsed_networks if network)
+    for node in nodes:
+        networks.extend(node.networks)
+    for bridge in bridges:
+        networks.extend(bridge.networks)
+
+    return KnownTopology(nodes=nodes, bridges=bridges, networks=deduplicate(networks))
+
+
+def load_known_topology(path: Path | None) -> KnownTopology:
+    if path is None:
+        return KnownTopology()
+    if yaml is None:
+        raise RuntimeError("PyYAML est requis pour --known-topology. Installe le paquet 'PyYAML'.")
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RuntimeError(f"Impossible de lire known_topology.yml : {exc}") from exc
+    return parse_known_topology(data or {})
+
+
+def role_label(role: str, *, vmid: str = "", ctid: str = "") -> str:
+    normalized = role.strip().lower()
+    if normalized in {"pfsense", "firewall_pfsense"}:
+        return "firewall pfSense"
+    if normalized in {"firewall", "router", "routeur"}:
+        return "firewall" if normalized == "firewall" else "routeur"
+    if normalized in {"proxmox", "pve", "hypervisor", "hyperviseur"}:
+        return "hôte Proxmox"
+    if normalized in {"vm", "virtual_machine"} or vmid:
+        return "VM Proxmox"
+    if normalized in {"ct", "lxc", "container", "conteneur"} or ctid:
+        return "conteneur Proxmox"
+    return role.strip()
+
+
+def known_node_note(node: KnownNode) -> str:
+    details: list[str] = []
+    if node.vmid:
+        details.append(f"VMID {node.vmid}")
+    if node.ctid:
+        details.append(f"CTID {node.ctid}")
+    if node.bridges:
+        details.append("bridges " + ", ".join(node.bridges))
+    interface_names = [interface.name for interface in node.interfaces if interface.name]
+    if interface_names:
+        details.append("interfaces " + ", ".join(interface_names))
+    return "Topologie connue : " + "; ".join(details) if details else "Topologie connue."
+
+
+def apply_known_node_to_device(device: Device, node: KnownNode, *, ip: str | None = None) -> None:
+    if node.name:
+        device.hostname = node.name
+    matching_interface = next((interface for interface in node.interfaces if interface.ip == ip), None)
+    if matching_interface and matching_interface.mac:
+        device.mac = matching_interface.mac
+    elif node.macs:
+        device.mac = node.macs[0]
+    if not device.status:
+        device.status = "known"
+    if node.role:
+        device.role = node.role
+        label = role_label(node.role, vmid=node.vmid, ctid=node.ctid)
+        if label:
+            device.device_type = label
+    if node.vmid:
+        device.vmid = node.vmid
+    if node.ctid:
+        device.ctid = node.ctid
+    append_unique(device.bridges, node.bridges)
+    if matching_interface and matching_interface.bridge:
+        append_unique(device.bridges, [matching_interface.bridge])
+    append_unique(device.interfaces, [interface.name for interface in node.interfaces if interface.name])
+    note = known_node_note(node)
+    if device.notes in {"", NO_OPEN_PORT_NOTE}:
+        device.notes = note
+    elif note not in device.notes:
+        device.notes = f"{device.notes} {note}"
+
+
+def apply_known_topology(devices: dict[str, Device], topology: KnownTopology) -> dict[str, Device]:
+    by_mac = {normalize_mac(device.mac): device for device in devices.values() if normalize_mac(device.mac)}
+    for node in topology.nodes:
+        for ip in node.ips:
+            device = devices.get(ip)
+            if device is None:
+                device = Device(ip=ip, status="known")
+                devices[ip] = device
+            apply_known_node_to_device(device, node, ip=ip)
+        if not node.ips:
+            for mac in node.macs:
+                device = by_mac.get(mac)
+                if device:
+                    apply_known_node_to_device(device, node)
+    return dict(sorted(devices.items(), key=lambda kv: ipaddress.IPv4Address(kv[0])))
+
+
+def known_gateway_ips(topology: KnownTopology) -> dict[str, str]:
+    gateways: dict[str, str] = {}
+    for node in topology.nodes:
+        role = node.role.lower()
+        if not any(token in role for token in ("pfsense", "firewall", "router", "routeur")):
+            continue
+        for ip in node.ips:
+            gateways[f"known:{node.name or ip}"] = ip
+    return gateways
+
+
+def known_observations_from_topology(topology: KnownTopology) -> list[MacObservation]:
+    observations: list[MacObservation] = []
+    for node in topology.nodes:
+        for interface in node.interfaces:
+            if not interface.ip or not interface.mac:
+                continue
+            observation = normalize_observation(
+                ip=interface.ip,
+                mac=interface.mac,
+                source="known_topology",
+                sample=0,
+                hostname=node.name,
+            )
+            if observation:
+                observations.append(observation)
+    return observations
+
+
 def parse_nmap_xml(path: Path) -> dict[str, Device]:
     if not path.exists():
         return {}
@@ -425,15 +958,30 @@ def classify_device(device: Device, gateway_ips: set[str] | None = None) -> None
     def add(label: str, points: int = 1) -> None:
         scores[label] = scores.get(label, 0) + points
 
+    known_label = ""
+    if device.role or device.vmid or device.ctid:
+        known_label = role_label(device.role, vmid=device.vmid, ctid=device.ctid)
+    if known_label:
+        add(known_label, 10)
     if device.ip in gateway_ips:
         add("routeur", 5)
     if {"53", "67", "68", "500", "4500", "1701", "1723"} & ports:
         add("routeur", 2)
     if any(token in text for token in ("router", "gateway", "box", "livebox", "freebox", "fritz", "mikrotik")):
         add("routeur", 3)
+    if "main_login.asp" in text or "httpd/3.0" in text:
+        add("routeur/AP ASUS probable", 6)
     firewall_tokens = ("pfsense", "opnsense", "fortinet", "fortigate", "sophos", "watchguard", "firewall")
     if any(token in text for token in firewall_tokens):
         add("firewall", 4)
+    if (
+        device.ip in gateway_ips
+        and "freebsd" in text
+        and "unbound" in text
+        and "nginx" in text
+        and ("22" in ports or "ssh" in text or "openssh" in text)
+    ):
+        add("firewall pfSense", 8)
     if any(token in text for token in ("switch", "catalyst", "procurve", "netgear gs", "aruba", "d-link")):
         add("switch", 3)
     if "161" in ports and any(token in text for token in ("cisco", "juniper", "hpe", "aruba", "netgear", "zyxel")):
@@ -468,20 +1016,25 @@ def classify_device(device: Device, gateway_ips: set[str] | None = None) -> None
     selected = [label for label, score in ordered if score >= 2][:3]
     device.device_type = " / ".join(selected) if selected else "équipement inconnu à qualifier"
 
+    if device.ports and device.notes == NO_OPEN_PORT_NOTE:
+        device.notes = ""
     if not device.notes:
-        device.notes = "" if device.ports else "Hôte actif, aucun port ouvert dans la liste scannée."
+        device.notes = "" if device.ports else NO_OPEN_PORT_NOTE
 
 
 def merge_device(dst: Device | None, src: Device) -> Device:
     if dst is None:
         return src
 
-    for attr in ("hostname", "mac", "vendor", "status", "os_guess", "os_accuracy", "device_type", "notes"):
+    merge_attrs = ("hostname", "mac", "vendor", "status", "os_guess", "os_accuracy", "device_type", "notes")
+    for attr in (*merge_attrs, "role", "vmid", "ctid"):
         val = getattr(src, attr)
         if val:
             setattr(dst, attr, val)
     append_unique(dst.ports, src.ports)
     append_unique(dst.services, src.services)
+    append_unique(dst.bridges, src.bridges)
+    append_unique(dst.interfaces, src.interfaces)
     classify_device(dst)
     return dst
 
@@ -675,7 +1228,9 @@ def sample_neighbor_observations(
 
 
 def detect_ip_conflicts(observations: Iterable[MacObservation]) -> list[IpConflict]:
+    normalized_observations: list[MacObservation] = []
     by_ip: dict[str, list[MacObservation]] = {}
+    by_mac: dict[str, list[MacObservation]] = {}
     for observation in observations:
         normalized = normalize_observation(
             ip=observation.ip,
@@ -686,7 +1241,9 @@ def detect_ip_conflicts(observations: Iterable[MacObservation]) -> list[IpConfli
             hostname=observation.hostname,
         )
         if normalized:
+            normalized_observations.append(normalized)
             by_ip.setdefault(normalized.ip, []).append(normalized)
+            by_mac.setdefault(normalized.mac, []).append(normalized)
 
     conflicts: list[IpConflict] = []
     for ip, ip_observations in by_ip.items():
@@ -709,10 +1266,43 @@ def detect_ip_conflicts(observations: Iterable[MacObservation]) -> list[IpConfli
                 samples=samples,
                 severity=severity,
                 notes="Conflit IP probable : plusieurs adresses MAC distinctes observées pour la même IPv4.",
+                conflict_type="same_ip_multiple_macs",
             )
         )
 
-    return sorted(conflicts, key=lambda conflict: ipaddress.IPv4Address(conflict.ip))
+    for mac, mac_observations in by_mac.items():
+        ips = sorted({observation.ip for observation in mac_observations}, key=ipaddress.IPv4Address)
+        if len(ips) <= 1:
+            continue
+
+        sources = sorted({observation.source for observation in mac_observations if observation.source})
+        samples = sorted({str(observation.sample) for observation in mac_observations})
+        vendors = sorted({observation.vendor for observation in mac_observations if observation.vendor})
+        hostnames = sorted({observation.hostname for observation in mac_observations if observation.hostname})
+        severity = classify_conflict_severity(sources=sources, samples=samples)
+        conflicts.append(
+            IpConflict(
+                ip=", ".join(ips),
+                mac_addresses=[mac],
+                vendors=vendors,
+                hostnames=hostnames,
+                sources=sources,
+                samples=samples,
+                severity=severity,
+                notes="Anomalie probable : une même adresse MAC a été observée sur plusieurs IPv4.",
+                conflict_type="same_mac_multiple_ips",
+            )
+        )
+
+    return sorted(conflicts, key=conflict_sort_key)
+
+
+def conflict_sort_key(conflict: IpConflict) -> tuple[ipaddress.IPv4Address, str]:
+    first_ip = conflict.ip.split(",", maxsplit=1)[0].strip()
+    try:
+        return ipaddress.IPv4Address(first_ip), conflict.conflict_type
+    except ValueError:
+        return ipaddress.IPv4Address("255.255.255.255"), conflict.conflict_type
 
 
 def classify_conflict_severity(*, sources: list[str], samples: list[str]) -> str:
@@ -733,6 +1323,7 @@ def conflict_to_row(conflict: IpConflict) -> dict[str, str]:
         "samples": ", ".join(conflict.samples),
         "severity": conflict.severity,
         "notes": conflict.notes,
+        "conflict_type": conflict.conflict_type,
     }
 
 
@@ -740,7 +1331,17 @@ def write_ip_conflicts_csv(conflicts: list[IpConflict], path: Path) -> None:
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["ip", "mac_addresses", "vendors", "hostnames", "sources", "samples", "severity", "notes"],
+            fieldnames=[
+                "conflict_type",
+                "ip",
+                "mac_addresses",
+                "vendors",
+                "hostnames",
+                "sources",
+                "samples",
+                "severity",
+                "notes",
+            ],
             delimiter=";",
         )
         writer.writeheader()
@@ -809,6 +1410,223 @@ def nmap_services(
     return out_xml
 
 
+def build_vuln_command(nmap: str, subnet: str, out_xml: Path, *, mode: str) -> list[str]:
+    script = "safe" if mode == "safe" else "vuln"
+    return [nmap, "-sV", "--script", script, subnet, "-oX", str(out_xml)]
+
+
+def nmap_vulnerability_scan(
+    nmap: str,
+    subnet: str,
+    out_dir: Path,
+    log_file: Path,
+    *,
+    mode: str,
+    timeout: int,
+) -> Path:
+    out_xml = out_dir / f"vuln_{mode}_{safe_name(subnet)}.xml"
+    proc = run_command(build_vuln_command(nmap, subnet, out_xml, mode=mode), timeout=timeout, log_file=log_file)
+    if proc.returncode != 0:
+        print(f"[WARN] Scan vulnérabilités Nmap en échec sur {subnet}. Voir {log_file}")
+    return out_xml
+
+
+def passive_vulnerability_findings(devices: dict[str, Device]) -> list[VulnerabilityFinding]:
+    findings: list[VulnerabilityFinding] = []
+    for device in devices.values():
+        ports = {port.split("/")[0]: port for port in device.ports}
+        services = " | ".join(device.services)
+        host = device.hostname
+        if "22" in ports:
+            findings.append(
+                VulnerabilityFinding(
+                    ip=device.ip,
+                    host=host,
+                    port=ports["22"],
+                    service=matching_service(device, "22"),
+                    severity="low",
+                    title="SSH exposé",
+                    evidence=matching_service(device, "22") or services,
+                    recommendation=(
+                        "Restreindre SSH aux réseaux d'administration, imposer clés fortes "
+                        "et désactiver les mots de passe si possible."
+                    ),
+                    source="passive",
+                )
+            )
+        if "80" in ports:
+            findings.append(
+                VulnerabilityFinding(
+                    ip=device.ip,
+                    host=host,
+                    port=ports["80"],
+                    service=matching_service(device, "80"),
+                    severity="medium",
+                    title="HTTP non chiffré exposé",
+                    evidence=matching_service(device, "80") or services,
+                    recommendation=(
+                        "Privilégier HTTPS, limiter l'accès d'administration et vérifier "
+                        "les en-têtes/session côté application."
+                    ),
+                    source="passive",
+                )
+            )
+        smb_ports = [ports[port] for port in ("139", "445") if port in ports]
+        if smb_ports:
+            findings.append(
+                VulnerabilityFinding(
+                    ip=device.ip,
+                    host=host,
+                    port=", ".join(smb_ports),
+                    service=" | ".join(
+                        service
+                        for service in [matching_service(device, "139"), matching_service(device, "445")]
+                        if service
+                    ),
+                    severity="high",
+                    title="SMB exposé",
+                    evidence="Ports SMB ouverts : " + ", ".join(smb_ports),
+                    recommendation=(
+                        "Limiter SMB aux hôtes nécessaires, vérifier SMBv1, signatures SMB, "
+                        "comptes invités et partages anonymes."
+                    ),
+                    source="passive",
+                )
+            )
+        if "9100" in ports:
+            findings.append(
+                VulnerabilityFinding(
+                    ip=device.ip,
+                    host=host,
+                    port=ports["9100"],
+                    service=matching_service(device, "9100"),
+                    severity="medium",
+                    title="Port impression RAW 9100 exposé",
+                    evidence=matching_service(device, "9100") or services,
+                    recommendation=(
+                        "Limiter JetDirect/RAW 9100 aux serveurs d'impression autorisés "
+                        "et filtrer depuis les VLAN utilisateurs."
+                    ),
+                    source="passive",
+                )
+            )
+    return findings
+
+
+def matching_service(device: Device, port: str) -> str:
+    prefix = f"{port}/"
+    return next((service for service in device.services if service.startswith(prefix)), "")
+
+
+def parse_nmap_vulnerability_xml(path: Path) -> list[VulnerabilityFinding]:
+    if not path.exists():
+        return []
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError:
+        return []
+
+    findings: list[VulnerabilityFinding] = []
+    for host in root.findall("host"):
+        ip = ""
+        hostname = parse_hostnames(host)
+        for addr in host.findall("address"):
+            if addr.attrib.get("addrtype") == "ipv4":
+                ip = addr.attrib.get("addr", "")
+                break
+        if not ip:
+            continue
+        for port in host.findall("ports/port"):
+            proto = port.attrib.get("protocol", "")
+            portid = port.attrib.get("portid", "")
+            port_label = f"{portid}/{proto}" if proto else portid
+            service = build_service_label(portid, proto, port.find("service"))
+            for script in port.findall("script"):
+                findings.append(nmap_script_finding(ip, hostname, port_label, service, script))
+        for script in host.findall("hostscript/script"):
+            findings.append(nmap_script_finding(ip, hostname, "host", "hostscript", script))
+    return findings
+
+
+def nmap_script_finding(
+    ip: str,
+    hostname: str,
+    port: str,
+    service: str,
+    script: ET.Element,
+) -> VulnerabilityFinding:
+    script_id = script.attrib.get("id", "nmap-script")
+    output = script.attrib.get("output", "").strip()
+    severity = "medium"
+    lowered = f"{script_id} {output}".lower()
+    if any(token in lowered for token in ("vulnerable", "cve-", "critical")):
+        severity = "high"
+    elif any(token in lowered for token in ("not vulnerable", "false")):
+        severity = "info"
+    return VulnerabilityFinding(
+        ip=ip,
+        host=hostname,
+        port=port,
+        service=service,
+        severity=severity,
+        title=f"Nmap NSE {script_id}",
+        evidence=output[:500],
+        recommendation="Examiner la sortie NSE, confirmer manuellement et corriger selon l'avis éditeur/CVE concerné.",
+        source="nmap-nse",
+    )
+
+
+def write_vulnerabilities_csv(findings: list[VulnerabilityFinding], path: Path) -> None:
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["ip", "host", "port", "service", "severity", "title", "evidence", "recommendation", "source"],
+            delimiter=";",
+        )
+        writer.writeheader()
+        for finding in findings:
+            writer.writerow(asdict(finding))
+
+
+def write_vulnerabilities_json(findings: list[VulnerabilityFinding], path: Path) -> None:
+    payload = json.dumps([asdict(finding) for finding in findings], ensure_ascii=False, indent=2)
+    path.write_text(payload + "\n", encoding="utf-8")
+
+
+def write_vulnerability_report(findings: list[VulnerabilityFinding], path: Path) -> None:
+    lines = ["# Rapport vulnérabilités", ""]
+    if not findings:
+        lines.append("Aucune vulnérabilité ou exposition notable détectée par le mode sélectionné.")
+    else:
+        lines.extend(["| Sévérité | IP | Port | Titre | Source |", "|---|---|---|---|---|"])
+        for finding in findings:
+            lines.append(
+                "| "
+                + " | ".join(
+                    sanitize_markdown_cell(value)
+                    for value in [finding.severity, finding.ip, finding.port, finding.title, finding.source]
+                )
+                + " |"
+            )
+        lines.append("")
+        for finding in findings:
+            title = f"{finding.ip} {finding.port} - {finding.title}"
+            lines.extend(
+                [
+                    f"## {title}",
+                    "",
+                    f"- Sévérité : {finding.severity}",
+                    f"- Hôte : {finding.host or '-'}",
+                    f"- Service : {finding.service or '-'}",
+                    f"- Source : {finding.source}",
+                    f"- Preuve : {finding.evidence or '-'}",
+                    f"- Recommandation : {finding.recommendation}",
+                    "",
+                ]
+            )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def write_csv(devices: dict[str, Device], path: Path) -> None:
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(
@@ -861,30 +1679,98 @@ def mermaid_id(value: str) -> str:
     return "n" + re.sub(r"[^A-Za-z0-9_]", "_", value)
 
 
-def write_mermaid(devices: dict[str, Device], subnets: list[str], gateways: dict[str, str], path: Path) -> None:
-    lines = ["flowchart TD", "    SCAN[Poste de scan]"]
-    gw_ips = set(gateways.values())
+def write_mermaid(
+    devices: dict[str, Device],
+    subnets: list[str],
+    gateways: dict[str, str],
+    path: Path,
+    *,
+    topology: KnownTopology | None = None,
+) -> None:
+    path.write_text(build_mermaid(devices, subnets, gateways, topology=topology) + "\n", encoding="utf-8")
 
+
+def build_mermaid(
+    devices: dict[str, Device],
+    subnets: list[str],
+    gateways: dict[str, str],
+    *,
+    topology: KnownTopology | None = None,
+) -> str:
+    topology = topology or KnownTopology()
+    lines = ["flowchart TD", "    SCAN[Poste de scan]"]
+    seen_lines = set(lines)
+
+    def add(line: str) -> None:
+        if line not in seen_lines:
+            lines.append(line)
+            seen_lines.add(line)
+
+    subnet_ids: dict[str, str] = {}
+    subnet_nets: dict[str, ipaddress.IPv4Network] = {}
     for subnet in subnets:
         sid = mermaid_id("subnet_" + subnet)
-        lines.append(f'    {sid}["{subnet}"]')
-        subnet_net = ipaddress.IPv4Network(subnet, strict=False)
-        subnet_gateways = [gw for gw in gw_ips if ipaddress.IPv4Address(gw) in subnet_net]
+        subnet_ids[subnet] = sid
+        subnet_nets[subnet] = ipaddress.IPv4Network(subnet, strict=False)
+        add(f'    {sid}["{subnet}"]')
 
+    bridge_networks: dict[str, set[str]] = {bridge.name: set(bridge.networks) for bridge in topology.bridges}
+    bridge_interfaces: dict[str, list[str]] = {bridge.name: bridge.interfaces for bridge in topology.bridges}
+    for device in devices.values():
+        for bridge in device.bridges:
+            bridge_networks.setdefault(bridge, set())
+            bridge_interfaces.setdefault(bridge, [])
+            for subnet, subnet_net in subnet_nets.items():
+                try:
+                    if ipaddress.IPv4Address(device.ip) in subnet_net:
+                        bridge_networks[bridge].add(subnet)
+                except ValueError:
+                    continue
+
+    for bridge_name, networks in bridge_networks.items():
+        bid = mermaid_id("bridge_" + bridge_name)
+        interface_label = ", ".join(bridge_interfaces.get(bridge_name, [])[:6])
+        label = "\n".join(part for part in [bridge_name, "bridge", interface_label] if part)
+        add(f'    {bid}["{escape_mermaid_label(label)}"]')
+        for network in networks:
+            if network in subnet_ids:
+                add(f"    {subnet_ids[network]} --> {bid}")
+
+    router_ips = set()
+    for node in topology.nodes:
+        role = node.role.lower()
+        if not any(token in role for token in ("pfsense", "firewall", "router", "routeur")):
+            continue
+        rid = mermaid_id("known_router_" + (node.name or "_".join(node.ips)))
+        label = "\n".join(part for part in [node.name, role_label(node.role), ", ".join(node.ips)] if part)
+        add(f'    {rid}["{escape_mermaid_label(label)}"]')
+        add(f"    SCAN --> {rid}")
+        for ip in node.ips:
+            router_ips.add(ip)
+            for subnet, subnet_net in subnet_nets.items():
+                if ipaddress.IPv4Address(ip) in subnet_net:
+                    add(f"    {rid} --> {subnet_ids[subnet]}")
+
+    gw_ips = set(gateways.values()) - router_ips
+    for subnet, subnet_net in subnet_nets.items():
+        subnet_gateways = [gw for gw in gw_ips if ipaddress.IPv4Address(gw) in subnet_net]
         if subnet_gateways:
             for gw in subnet_gateways:
                 gwid = mermaid_id(gw)
                 label = gw
                 if gw in devices:
                     d = devices[gw]
-                    label = f"{gw}\\n{d.hostname or d.vendor or d.device_type}"
-                lines.append(f'    {gwid}["{escape_mermaid_label(label)}"]')
-                lines.append(f"    SCAN --> {gwid}")
-                lines.append(f"    {gwid} --> {sid}")
-        else:
-            lines.append(f"    SCAN --> {sid}")
+                    label = f"{gw}\n{d.hostname or d.vendor or d.device_type}"
+                add(f'    {gwid}["{escape_mermaid_label(label)}"]')
+                add(f"    SCAN --> {gwid}")
+                add(f"    {gwid} --> {subnet_ids[subnet]}")
+        elif not router_ips:
+            add(f"    SCAN --> {subnet_ids[subnet]}")
 
+    for subnet, subnet_net in subnet_nets.items():
         for device in devices.values():
+            if device.ip in router_ips:
+                continue
             try:
                 if ipaddress.IPv4Address(device.ip) not in subnet_net:
                     continue
@@ -893,11 +1779,16 @@ def write_mermaid(devices: dict[str, Device], subnets: list[str], gateways: dict
 
             did = mermaid_id(device.ip)
             label_parts = [device.ip, device.hostname, device.vendor, device.device_type]
-            label = "\\n".join(part for part in label_parts if part)
-            lines.append(f'    {did}["{escape_mermaid_label(label)}"]')
-            lines.append(f"    {sid} --> {did}")
+            label = "\n".join(part for part in label_parts if part)
+            add(f'    {did}["{escape_mermaid_label(label)}"]')
+            parent = ""
+            for bridge in device.bridges:
+                if bridge in bridge_networks:
+                    parent = mermaid_id("bridge_" + bridge)
+                    break
+            add(f"    {parent or subnet_ids[subnet]} --> {did}")
 
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return "\n".join(lines)
 
 
 def escape_mermaid_label(value: str) -> str:
@@ -1001,8 +1892,8 @@ def build_markdown_report(
     if conflicts:
         lines.extend(
             [
-                "| IP | MAC observées | Sources | Samples | Sévérité | Notes |",
-                "|---|---|---|---|---|---|",
+                "| Type | IP | MAC observées | Sources | Samples | Sévérité | Notes |",
+                "|---|---|---|---|---|---|---|",
             ]
         )
         for conflict in conflicts:
@@ -1011,6 +1902,7 @@ def build_markdown_report(
                 + " | ".join(
                     sanitize_markdown_cell(value)
                     for value in [
+                        conflict.conflict_type,
                         conflict.ip,
                         ", ".join(conflict.mac_addresses),
                         ", ".join(conflict.sources),
@@ -1085,6 +1977,7 @@ def write_html_report(
     )
     conflict_rows = "\n".join(
         "<tr>"
+        f"<td>{html.escape(conflict.conflict_type)}</td>"
         f"<td>{html.escape(conflict.ip)}</td>"
         f"<td>{html.escape(', '.join(conflict.mac_addresses))}</td>"
         f"<td>{html.escape(', '.join(conflict.sources))}</td>"
@@ -1099,7 +1992,10 @@ def write_html_report(
         if not conflicts
         else f"""<table>
     <thead>
-      <tr><th>IP</th><th>MAC observées</th><th>Sources</th><th>Samples</th><th>Sévérité</th><th>Notes</th></tr>
+      <tr>
+        <th>Type</th><th>IP</th><th>MAC observées</th><th>Sources</th>
+        <th>Samples</th><th>Sévérité</th><th>Notes</th>
+      </tr>
     </thead>
     <tbody>{conflict_rows}</tbody>
   </table>
@@ -1199,6 +2095,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Détecte automatiquement les sous-réseaux IPv4 privés du PC.",
     )
+    parser.add_argument(
+        "--debug-auto",
+        action="store_true",
+        help="Affiche les interfaces détectées automatiquement et les réseaux retenus.",
+    )
+    parser.add_argument(
+        "--known-topology",
+        type=Path,
+        default=None,
+        help="Fichier YAML de topologie connue pour surcharger noms, rôles, IP, MAC, VMID/CTID et bridges.",
+    )
     parser.add_argument("--ports", default=None, help=f"Ports à scanner, format Nmap. Défaut : {DEFAULT_PORTS}")
     parser.add_argument(
         "--top-ports",
@@ -1239,6 +2146,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Intervalle en secondes entre deux échantillons ARP/neigh. Défaut : 2.",
     )
     parser.add_argument(
+        "--vuln",
+        choices=["passive", "safe", "nse"],
+        default=None,
+        help="Analyse vulnérabilités : passive sans scan, safe avec NSE safe, nse avec scripts vuln confirmés.",
+    )
+    parser.add_argument(
+        "--confirm-vuln-scan",
+        action="store_true",
+        help="Confirmation obligatoire pour --vuln nse.",
+    )
+    parser.add_argument(
         "--timeout",
         type=positive_int,
         default=1800,
@@ -1250,12 +2168,21 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.vuln == "nse" and not args.confirm_vuln_scan:
+        parser.error("--vuln nse nécessite --confirm-vuln-scan")
+
     nmap = require_nmap()
+    try:
+        known_topology = load_known_topology(args.known_topology)
+    except RuntimeError as exc:
+        print(f"ERREUR : {exc}", file=sys.stderr)
+        return 2
 
     subnets: list[str] = []
     if args.auto:
-        subnets.extend(detect_local_networks())
+        subnets.extend(detect_local_networks(timeout=min(args.timeout, 30), debug_auto=args.debug_auto))
     subnets.extend(args.subnet)
+    subnets.extend(known_topology.networks)
     subnets = validate_subnets(subnets)
 
     if not subnets:
@@ -1269,6 +2196,7 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     log_file = out_dir / "commands.log"
     gateways = detect_default_gateways(timeout=min(args.timeout, 30))
+    gateways.update(known_gateway_ips(known_topology))
     selected_ports = args.ports or DEFAULT_PORTS
 
     print(f"[INFO] Nmap : {nmap}")
@@ -1283,7 +2211,7 @@ def main(argv: list[str] | None = None) -> int:
     print(ports_message)
 
     all_maps: list[dict[str, Device]] = []
-    conflict_observations: list[MacObservation] = []
+    conflict_observations: list[MacObservation] = known_observations_from_topology(known_topology)
     nmap_sample = 0
     for subnet in subnets:
         print(f"[INFO] Découverte : {subnet}")
@@ -1312,6 +2240,8 @@ def main(argv: list[str] | None = None) -> int:
 
     devices = merge_devices(*all_maps)
     apply_gateway_classification(devices, gateways)
+    devices = apply_known_topology(devices, known_topology)
+    apply_gateway_classification(devices, gateways)
 
     if args.detect_ip_conflicts:
         print(
@@ -1330,13 +2260,36 @@ def main(argv: list[str] | None = None) -> int:
     if ip_conflicts:
         print(f"[WARN] Conflits IP probables détectés : {len(ip_conflicts)}")
 
+    vulnerability_findings: list[VulnerabilityFinding] = []
+    if args.vuln:
+        vulnerability_findings.extend(passive_vulnerability_findings(devices))
+        if args.vuln in {"safe", "nse"}:
+            print(f"[INFO] Scan vulnérabilités Nmap : mode {args.vuln}")
+            for subnet in subnets:
+                vuln_xml = nmap_vulnerability_scan(
+                    nmap,
+                    subnet,
+                    out_dir,
+                    log_file,
+                    mode=args.vuln,
+                    timeout=args.timeout,
+                )
+                vulnerability_findings.extend(parse_nmap_vulnerability_xml(vuln_xml))
+
     csv_path = out_dir / "devices.csv"
     conflicts_csv_path = out_dir / "ip_conflicts.csv"
     mermaid_path = out_dir / "topology.mmd"
     report_path = out_dir / "report.md"
+    vulnerabilities_csv_path = out_dir / "vulnerabilities.csv"
+    vulnerabilities_json_path = out_dir / "vulnerabilities.json"
+    vulnerabilities_report_path = out_dir / "vulnerability_report.md"
     write_csv(devices, csv_path)
     write_ip_conflicts_csv(ip_conflicts, conflicts_csv_path)
-    write_mermaid(devices, subnets, gateways, mermaid_path)
+    if args.vuln:
+        write_vulnerabilities_csv(vulnerability_findings, vulnerabilities_csv_path)
+        write_vulnerabilities_json(vulnerability_findings, vulnerabilities_json_path)
+        write_vulnerability_report(vulnerability_findings, vulnerabilities_report_path)
+    write_mermaid(devices, subnets, gateways, mermaid_path, topology=known_topology)
     mermaid_text = mermaid_path.read_text(encoding="utf-8")
     write_report(devices, subnets, gateways, ip_conflicts, report_path, mermaid_text=mermaid_text)
 
@@ -1358,6 +2311,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"- JSON     : {json_path.resolve()}")
     if args.html_report:
         print(f"- HTML     : {html_path.resolve()}")
+    if args.vuln:
+        print(f"- Vuln CSV : {vulnerabilities_csv_path.resolve()}")
+        print(f"- Vuln JSON: {vulnerabilities_json_path.resolve()}")
+        print(f"- Vuln MD  : {vulnerabilities_report_path.resolve()}")
     print("")
     print("Conseil : ouvre report.md dans VS Code ou colle topology.mmd dans https://mermaid.live")
     return 0

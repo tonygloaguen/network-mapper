@@ -122,3 +122,18 @@ def test_nmap_observations_integration() -> None:
         and observation.source == "nmap"
         for observation in observations
     )
+
+
+def test_detect_conflict_same_mac_multiple_ips() -> None:
+    conflicts = detect_ip_conflicts(
+        [
+            MacObservation(ip="192.168.20.18", mac="30:C5:99:DD:81:CC", source="arp", sample=1),
+            MacObservation(ip="192.168.20.60", mac="30-C5-99-DD-81-CC", source="ip_neigh", sample=2),
+        ]
+    )
+
+    assert len(conflicts) == 1
+    assert conflicts[0].conflict_type == "same_mac_multiple_ips"
+    assert conflicts[0].ip == "192.168.20.18, 192.168.20.60"
+    assert conflicts[0].mac_addresses == ["30:C5:99:DD:81:CC"]
+    assert conflicts[0].severity == "high"

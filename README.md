@@ -10,6 +10,7 @@ Utilise cet outil uniquement sur des réseaux que tu possèdes, administres ou p
 
 - Python 3.10 ou plus récent.
 - Nmap installé et présent dans le `PATH`.
+- PyYAML si tu utilises `--known-topology` : `python -m pip install PyYAML`.
 - Droits administrateur/root recommandés pour l'identification OS Nmap (`-O`). Sans ces droits, le script relance automatiquement le scan services sans `-O`.
 
 ## Installation de Python
@@ -71,6 +72,10 @@ python .\network_mapper.py --subnet 192.168.20.0/24 --skip-os
 python .\network_mapper.py --subnet 192.168.20.0/24 --json --html-report
 python .\network_mapper.py --subnet 192.168.20.0/24 --top-ports 100 --timeout 2400
 python .\network_mapper.py --auto --detect-ip-conflicts
+python .\network_mapper.py --auto --debug-auto
+python .\network_mapper.py --auto --known-topology known_topology.yml
+python .\network_mapper.py --auto --known-topology known_topology.yml --vuln passive
+python .\network_mapper.py --auto --vuln nse --confirm-vuln-scan
 ```
 
 Plusieurs sous-réseaux :
@@ -88,12 +93,70 @@ python3 network_mapper.py --subnet 192.168.20.0/24 --skip-os
 python3 network_mapper.py --subnet 192.168.20.0/24 --json --html-report
 python3 network_mapper.py --subnet 192.168.20.0/24 --top-ports 100 --timeout 2400
 python3 network_mapper.py --auto --detect-ip-conflicts
+python3 network_mapper.py --auto --debug-auto
+python3 network_mapper.py --auto --known-topology known_topology.yml
+python3 network_mapper.py --auto --known-topology known_topology.yml --vuln passive
+python3 network_mapper.py --subnet 192.168.20.0/24 --vuln safe
 ```
 
 Plusieurs sous-réseaux :
 
 ```bash
 python3 network_mapper.py --subnet 192.168.20.0/24 --subnet 192.168.30.0/24
+```
+
+## Topologie connue
+
+`--known-topology known_topology.yml` permet de corriger les limites d'une découverte Nmap pure : bridges Proxmox sans IP hôte, interfaces pfSense multi-réseaux, VM/CT et noms d'équipements. Les champs connus remplacent les déductions Nmap.
+
+Exemple adapté au lab :
+
+```yaml
+bridges:
+  vmbr0:
+    network: 192.168.1.0/24
+    interfaces: [tap100i0]
+  vmbr1:
+    network: 192.168.20.0/24
+    interfaces: [tap100i1, tap102i0, veth200i0, enp1s0f0]
+
+nodes:
+  - name: pve-home
+    role: proxmox
+    ip: 192.168.1.2/24
+    bridges: [vmbr0, vmbr1]
+  - name: pfSense
+    role: pfsense
+    vmid: 100
+    interfaces:
+      - name: em0
+        ip: 192.168.1.56/24
+        bridge: vmbr0
+      - name: em1
+        ip: 192.168.20.1/24
+        mac: BC:24:11:12:0B:E6
+        bridge: vmbr1
+  - name: FacturX-debian
+    role: vm
+    vmid: 102
+    interfaces:
+      - name: ens18
+        ip: 192.168.20.28/24
+        mac: BC:24:11:69:F4:A9
+        bridge: vmbr1
+  - name: gdrive-backup
+    role: ct
+    ctid: 200
+    bridge: vmbr1
+```
+
+Exemples :
+
+```bash
+python network_mapper.py --auto --known-topology known_topology.yml
+python network_mapper.py --auto --known-topology known_topology.yml --vuln passive
+python network_mapper.py --subnet 192.168.20.0/24 --vuln safe
+python network_mapper.py --auto --vuln nse --confirm-vuln-scan
 ```
 
 Détection de conflits IP avec réglage de l'échantillonnage :
@@ -104,7 +167,9 @@ python network_mapper.py --subnet 192.168.20.0/24 --detect-ip-conflicts --confli
 
 ## Options principales
 
-- `--auto` : détecte les sous-réseaux IPv4 privés de la machine locale via `ipconfig` sous Windows ou `ip/ifconfig` sous Linux.
+- `--auto` : détecte les sous-réseaux IPv4 privés de la machine locale. Sous Windows, PowerShell `Get-NetIPAddress -AddressFamily IPv4` est utilisé en priorité, avec fallback `ipconfig /all`.
+- `--debug-auto` : affiche les interfaces vues par la détection automatique et les réseaux conservés.
+- `--known-topology` : charge un YAML de topologie connue pour imposer noms, rôles, IP, MAC, VMID/CTID, bridges et interfaces. Ces données priment sur Nmap.
 - `--subnet` : ajoute un sous-réseau à scanner. L'option est répétable.
 - `--ports` : définit une liste de ports au format Nmap.
 - `--top-ports` : utilise les N ports les plus courants selon Nmap au lieu de la liste par défaut.
@@ -113,6 +178,9 @@ python network_mapper.py --subnet 192.168.20.0/24 --detect-ip-conflicts --confli
 - `--json` : génère `devices.json`.
 - `--html-report` : génère `report.html`.
 - `--detect-ip-conflicts` : échantillonne la table ARP/neigh locale pour détecter des conflits IP probables.
+- `--vuln passive` : analyse localement les ports/services déjà détectés, sans scan supplémentaire.
+- `--vuln safe` : lance des scripts NSE `safe` en plus de l'analyse passive.
+- `--vuln nse --confirm-vuln-scan` : lance les scripts NSE `vuln`; ce mode exige une confirmation explicite et n'est jamais activé par défaut.
 - `--conflict-samples` : nombre d'échantillons ARP/neigh, par défaut `3`.
 - `--conflict-interval` : intervalle entre deux échantillons, par défaut `2` secondes.
 - `--timeout` : définit le timeout par commande Nmap en secondes.
@@ -122,7 +190,10 @@ python network_mapper.py --subnet 192.168.20.0/24 --detect-ip-conflicts --confli
 Par défaut, les fichiers sont écrits dans `network_map_output/` :
 
 - `devices.csv` : inventaire tabulaire des équipements.
-- `ip_conflicts.csv` : conflits IP probables observés à partir des MAC Nmap et, si activé, ARP/neigh.
+- `ip_conflicts.csv` : conflits IP probables observés à partir des MAC Nmap, de la topologie connue et, si activé, ARP/neigh.
+- `vulnerabilities.csv` : expositions/vulnérabilités détectées si `--vuln` est utilisé.
+- `vulnerabilities.json` : export JSON des vulnérabilités si `--vuln` est utilisé.
+- `vulnerability_report.md` : rapport Markdown des vulnérabilités si `--vuln` est utilisé.
 - `report.md` : rapport Markdown lisible et versionnable.
 - `topology.mmd` : schéma Mermaid de topologie logique.
 - `commands.log` : commandes Nmap exécutées, code retour, sortie standard et erreur.
@@ -148,7 +219,7 @@ Par défaut, les fichiers sont écrits dans `network_map_output/` :
 
 ## Détection de conflits IP
 
-Un conflit IP probable est signalé quand une même adresse IPv4 est observée avec plusieurs adresses MAC différentes. Le script utilise toujours les MAC vues dans les résultats XML Nmap. Avec `--detect-ip-conflicts`, il ajoute plusieurs échantillons de la table locale des voisins : `arp -a` sous Windows, `ip neigh` sous Linux, puis `arp -n` en fallback si disponible.
+Un conflit IP probable est signalé quand une même adresse IPv4 est observée avec plusieurs adresses MAC différentes. Une anomalie `same_mac_multiple_ips` est aussi signalée quand une même MAC apparaît sur plusieurs IPv4, par exemple une MAC vue sur `192.168.20.18` puis `192.168.20.60`. Le script utilise les MAC vues dans Nmap et dans `known_topology.yml`. Avec `--detect-ip-conflicts`, il ajoute plusieurs échantillons de la table locale des voisins : `arp -a` sous Windows, `ip neigh` sous Linux, puis `arp -n` en fallback si disponible.
 
 Les adresses MAC sont normalisées en format `AA:BB:CC:DD:EE:FF`. Les entrées vides, incomplètes, broadcast `FF:FF:FF:FF:FF:FF`, nulles `00:00:00:00:00:00` ou invalides sont ignorées.
 
@@ -179,7 +250,7 @@ Cette détection reste prudente : elle indique un conflit IP probable, pas une c
 
 ## Schéma Mermaid
 
-`topology.mmd` représente une topologie logique : poste de scan, passerelles détectées, sous-réseaux et hôtes. Il peut être visualisé dans VS Code avec une extension Mermaid ou sur <https://mermaid.live>.
+`topology.mmd` représente une topologie logique : poste de scan, passerelles/firewalls, sous-réseaux, bridges connus et hôtes. Avec `known_topology.yml`, pfSense peut être affiché comme routeur/firewall entre WAN et LAN, et les bridges Proxmox `vmbr0`/`vmbr1` peuvent apparaître même si un bridge n'a pas d'IPv4 côté hôte. Le schéma peut être visualisé dans VS Code avec une extension Mermaid ou sur <https://mermaid.live>.
 
 ## Limites de la détection Nmap
 
@@ -197,7 +268,7 @@ Pour une topologie physique fiable, il faut compléter Nmap avec SNMP, LLDP, CDP
 
 Nmap introuvable : vérifie `nmap --version` et redémarre le terminal après installation.
 
-Aucun sous-réseau avec `--auto` : précise `--subnet` manuellement, par exemple `192.168.20.0/24`.
+Aucun sous-réseau avec `--auto` : relance avec `--debug-auto`. Sous Windows, vérifie que PowerShell peut exécuter `Get-NetIPAddress -AddressFamily IPv4`. Tu peux aussi préciser `--subnet` manuellement, par exemple `192.168.20.0/24`, ou fournir `--known-topology known_topology.yml`.
 
 Scan OS en échec : relance avec `--skip-os`, ou démarre PowerShell en administrateur / utilise `sudo` sous Linux.
 
