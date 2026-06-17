@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<nmaprun scanner="nmap">
+  <host>
+    <status state="up"/>
+    <address addr="192.168.20.1" addrtype="ipv4"/>
+    <address addr="00:11:22:33:44:55" addrtype="mac" vendor="Netgate pfSense"/>
+    <hostnames><hostname name="fw-gateway.local" type="PTR"/></hostnames>
+    <ports>
+      <port protocol="tcp" portid="53"><state state="open"/><service name="domain" product="dnsmasq"/></port>
+      <port protocol="tcp" portid="443"><state state="open"/><service name="https" product="pfSense webConfigurator"/></port>
+      <port protocol="udp" portid="500"><state state="open"/><service name="isakmp" product="strongSwan"/></port>
+    </ports>
+    <os><osmatch name="FreeBSD 12.0-STABLE" accuracy="94"/></os>
+  </host>
+  <host>
+    <status state="up"/>
+    <address addr="192.168.20.50" addrtype="ipv4"/>
+    <address addr="00:AA:BB:CC:DD:EE" addrtype="mac" vendor="Hewlett Packard"/>
+    <hostnames><hostname name="printer-office.local" type="PTR"/></hostnames>
+    <ports>
+      <port protocol="tcp" portid="9100"><state state="open"/><service name="jetdirect" product="HP JetDirect printer"/></port>
+      <port protocol="tcp" portid="631"><state state="open"/><service name="ipp" product="CUPS"/></port>
+    </ports>
+  </host>
+  <host>
+    <status state="up"/>
+    <address addr="192.168.20.60" addrtype="ipv4"/>
+    <address addr="00:11:32:AA:BB:CC" addrtype="mac" vendor="Synology Incorporated"/>
+    <hostnames><hostname name="nas-office.local" type="PTR"/></hostnames>
+    <ports>
+      <port protocol="tcp" portid="22"><state state="open"/><service name="ssh" product="OpenSSH" version="9.2" ostype="Linux"/></port>
+      <port protocol="tcp" portid="445"><state state="open"/><service name="microsoft-ds" product="Samba smbd"/></port>
+      <port protocol="tcp" portid="5000"><state state="open"/><service name="http" product="Synology DSM"/></port>
+    </ports>
+    <os><osmatch name="Linux 4.4 - 5.4" accuracy="98"/></os>
+  </host>
+  <host>
+    <status state="up"/>
+    <address addr="192.168.20.70" addrtype="ipv4"/>
+    <hostnames><hostname name="unknown.local" type="PTR"/></hostnames>
+  </host>
+</nmaprun>

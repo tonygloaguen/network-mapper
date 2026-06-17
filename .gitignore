@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Project outputs
+network_map_output/
+reports/
+devices.csv
+ip_conflicts.csv
+devices.json
+report.md
+report.html
+topology.mmd
+commands.log
+nmap_*.xml
+*_nmap.xml
+discovery_*.xml
+services_*.xml
+*.nmap.xml
+!tests/fixtures/*.xml
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# OS temporary files
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.swp
+*.swo
+
+# IDEs
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+
+# Local run / Codex artifacts
+codeburn-*.json

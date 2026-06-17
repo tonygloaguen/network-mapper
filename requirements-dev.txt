@@ -1,0 +1,7 @@
+bandit
+coverage
+mypy
+pip-audit
+pytest
+pytest-cov
+ruff

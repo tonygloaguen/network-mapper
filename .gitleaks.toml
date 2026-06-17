@@ -1,0 +1,10 @@
+title = "network-mapper gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures and documentation use only non-secret sample data."
+paths = [
+  '''tests/fixtures/.*''',
+]

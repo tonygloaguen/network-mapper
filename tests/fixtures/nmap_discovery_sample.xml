@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<nmaprun scanner="nmap">
+  <host>
+    <status state="up" reason="arp-response"/>
+    <address addr="192.168.20.1" addrtype="ipv4"/>
+    <address addr="00:11:22:33:44:55" addrtype="mac" vendor="pfSense"/>
+    <hostnames><hostname name="gateway.local" type="PTR"/></hostnames>
+  </host>
+  <host>
+    <status state="up" reason="arp-response"/>
+    <address addr="192.168.20.50" addrtype="ipv4"/>
+    <address addr="00:AA:BB:CC:DD:EE" addrtype="mac" vendor="HP"/>
+    <hostnames><hostname name="printer-office.local" type="PTR"/></hostnames>
+  </host>
+</nmaprun>
