@@ -49,6 +49,36 @@ def test_merge_known_topology_overrides_nmap_results() -> None:
     assert device.device_type == "VM Proxmox"
 
 
+def test_known_topology_removes_moved_mac_from_old_ip() -> None:
+    topology = parse_known_topology(
+        {
+            "nodes": [
+                {
+                    "name": "FacturX-debian",
+                    "role": "vm",
+                    "interfaces": [
+                        {
+                            "name": "ens18",
+                            "ip": "192.168.20.28/24",
+                            "mac": "BC:24:11:69:F4:A9",
+                            "bridge": "vmbr1",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    devices = {
+        "192.168.20.4": Device(ip="192.168.20.4", mac="BC:24:11:69:F4:A9", vendor="QEMU"),
+    }
+
+    merged = apply_known_topology(devices, topology)
+
+    assert merged["192.168.20.28"].mac == "BC:24:11:69:F4:A9"
+    assert merged["192.168.20.4"].mac == ""
+    assert merged["192.168.20.4"].vendor == ""
+
+
 def test_merge_device_clears_no_open_port_note_when_ports_arrive() -> None:
     discovery = {"192.168.20.28": Device(ip="192.168.20.28", status="up")}
     service = {"192.168.20.28": Device(ip="192.168.20.28", ports=["22/tcp"], services=["22/tcp ssh"])}
@@ -86,7 +116,7 @@ def test_mermaid_places_pfsense_between_wan_and_lan() -> None:
     assert "pfSense" in mermaid
     assert "vmbr0" in mermaid
     assert "vmbr1" in mermaid
-    assert "nknown_router_pfSense --> nsubnet_192_168_1_0_24" in mermaid
+    assert "nsubnet_192_168_1_0_24 --> nknown_router_pfSense" in mermaid
     assert "nknown_router_pfSense --> nsubnet_192_168_20_0_24" in mermaid
     assert "nsubnet_192_168_20_0_24 --> nbridge_vmbr1" in mermaid
 

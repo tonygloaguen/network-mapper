@@ -39,6 +39,12 @@ RFC1918_NETWORKS = (
     ipaddress.IPv4Network("172.16.0.0/12"),
     ipaddress.IPv4Network("192.168.0.0/16"),
 )
+DEFAULT_VIRTUAL_SUBNETS = (
+    ipaddress.IPv4Network("192.168.56.0/24"),
+    ipaddress.IPv4Network("192.168.14.0/24"),
+    ipaddress.IPv4Network("192.168.178.0/24"),
+    ipaddress.IPv4Network("172.16.0.0/12"),
+)
 
 
 @dataclass
@@ -216,6 +222,14 @@ def is_rfc1918_address(ip: ipaddress.IPv4Address) -> bool:
 
 def is_rfc1918_network(net: ipaddress.IPv4Network) -> bool:
     return any(net.subnet_of(network) for network in RFC1918_NETWORKS)
+
+
+def is_default_virtual_subnet(subnet: str) -> bool:
+    try:
+        net = ipaddress.IPv4Network(subnet, strict=False)
+    except ValueError:
+        return False
+    return any(net.subnet_of(virtual_net) for virtual_net in DEFAULT_VIRTUAL_SUBNETS)
 
 
 def detect_local_networks(timeout: int = 30, *, debug_auto: bool = False) -> list[str]:
@@ -807,6 +821,7 @@ def apply_known_topology(devices: dict[str, Device], topology: KnownTopology) ->
                 device = by_mac.get(mac)
                 if device:
                     apply_known_node_to_device(device, node)
+    clear_known_macs_from_other_ips(devices, topology)
     return dict(sorted(devices.items(), key=lambda kv: ipaddress.IPv4Address(kv[0])))
 
 
@@ -837,6 +852,32 @@ def known_observations_from_topology(topology: KnownTopology) -> list[MacObserva
             if observation:
                 observations.append(observation)
     return observations
+
+
+def known_mac_ip_owners(topology: KnownTopology) -> dict[str, set[str]]:
+    owners: dict[str, set[str]] = {}
+    for node in topology.nodes:
+        for interface in node.interfaces:
+            if interface.ip and interface.mac:
+                owners.setdefault(interface.mac, set()).add(interface.ip)
+        if len(node.macs) == 1 and node.ips:
+            owners.setdefault(node.macs[0], set()).update(node.ips)
+    return owners
+
+
+def clear_known_macs_from_other_ips(devices: dict[str, Device], topology: KnownTopology) -> None:
+    owners = known_mac_ip_owners(topology)
+    if not owners:
+        return
+    for device in devices.values():
+        normalized_mac = normalize_mac(device.mac)
+        if not normalized_mac:
+            continue
+        known_ips = owners.get(normalized_mac)
+        if known_ips and device.ip not in known_ips:
+            device.mac = ""
+            device.vendor = ""
+            classify_device(device)
 
 
 def parse_nmap_xml(path: Path) -> dict[str, Device]:
@@ -1745,11 +1786,23 @@ def build_mermaid(
         label = "\n".join(part for part in [node.name, role_label(node.role), ", ".join(node.ips)] if part)
         add(f'    {rid}["{escape_mermaid_label(label)}"]')
         add(f"    SCAN --> {rid}")
+        connected_subnets: list[str] = []
         for ip in node.ips:
             router_ips.add(ip)
+            try:
+                router_ip = ipaddress.IPv4Address(ip)
+            except ValueError:
+                continue
             for subnet, subnet_net in subnet_nets.items():
-                if ipaddress.IPv4Address(ip) in subnet_net:
-                    add(f"    {rid} --> {subnet_ids[subnet]}")
+                if router_ip in subnet_net and subnet not in connected_subnets:
+                    connected_subnets.append(subnet)
+        if len(connected_subnets) > 1:
+            add(f"    {subnet_ids[connected_subnets[0]]} --> {rid}")
+            for subnet in connected_subnets[1:]:
+                add(f"    {rid} --> {subnet_ids[subnet]}")
+        else:
+            for subnet in connected_subnets:
+                add(f"    {rid} --> {subnet_ids[subnet]}")
 
     gw_ips = set(gateways.values()) - router_ips
     for subnet, subnet_net in subnet_nets.items():
@@ -2070,6 +2123,23 @@ def validate_subnets(raw_subnets: Iterable[str]) -> list[str]:
     return deduplicate(valid)
 
 
+def resolve_scan_subnets(
+    *,
+    auto_subnets: Iterable[str] = (),
+    explicit_subnets: Iterable[str] = (),
+    extra_subnets: Iterable[str] = (),
+    known_subnets: Iterable[str] = (),
+    exclude_virtual_subnets: bool = True,
+) -> list[str]:
+    auto_valid = validate_subnets(auto_subnets)
+    if exclude_virtual_subnets:
+        auto_valid = [subnet for subnet in auto_valid if not is_default_virtual_subnet(subnet)]
+
+    requested_valid = validate_subnets([*explicit_subnets, *extra_subnets])
+    known_valid = validate_subnets(known_subnets)
+    return deduplicate([*auto_valid, *requested_valid, *known_valid])
+
+
 def positive_int(value: str) -> int:
     try:
         parsed = int(value)
@@ -2091,6 +2161,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sous-réseau à scanner, ex: 192.168.20.0/24. Répétable.",
     )
     parser.add_argument(
+        "--extra-subnet",
+        action="append",
+        default=[],
+        help="Sous-réseau à ajouter explicitement, utile avec --auto. Répétable.",
+    )
+    parser.add_argument(
         "--auto",
         action="store_true",
         help="Détecte automatiquement les sous-réseaux IPv4 privés du PC.",
@@ -2099,6 +2175,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--debug-auto",
         action="store_true",
         help="Affiche les interfaces détectées automatiquement et les réseaux retenus.",
+    )
+    parser.add_argument(
+        "--exclude-virtual-subnets",
+        action="store_true",
+        default=True,
+        help=(
+            "Ignore les sous-réseaux virtuels auto-détectés Windows/VMware/WSL "
+            "(comportement par défaut ; les réseaux demandés explicitement restent inclus)."
+        ),
+    )
+    parser.add_argument(
+        "--include-virtual-subnets",
+        action="store_false",
+        dest="exclude_virtual_subnets",
+        help="Conserve aussi les sous-réseaux virtuels auto-détectés.",
     )
     parser.add_argument(
         "--known-topology",
@@ -2178,12 +2269,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERREUR : {exc}", file=sys.stderr)
         return 2
 
-    subnets: list[str] = []
+    auto_subnets: list[str] = []
     if args.auto:
-        subnets.extend(detect_local_networks(timeout=min(args.timeout, 30), debug_auto=args.debug_auto))
-    subnets.extend(args.subnet)
-    subnets.extend(known_topology.networks)
-    subnets = validate_subnets(subnets)
+        auto_subnets = detect_local_networks(timeout=min(args.timeout, 30), debug_auto=args.debug_auto)
+    subnets = resolve_scan_subnets(
+        auto_subnets=auto_subnets,
+        explicit_subnets=args.subnet,
+        extra_subnets=args.extra_subnet,
+        known_subnets=known_topology.networks,
+        exclude_virtual_subnets=args.exclude_virtual_subnets,
+    )
 
     if not subnets:
         print("Aucun sous-réseau à scanner.")
