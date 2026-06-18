@@ -73,6 +73,7 @@ python .\network_mapper.py --subnet 192.168.20.0/24 --json --html-report
 python .\network_mapper.py --subnet 192.168.20.0/24 --top-ports 100 --timeout 2400
 python .\network_mapper.py --auto --detect-ip-conflicts
 python .\network_mapper.py --auto --debug-auto
+python .\network_mapper.py --auto --discover-routed-subnets
 python .\network_mapper.py --auto --known-topology known_topology.yml
 python .\network_mapper.py --auto --known-topology known_topology.yml --vuln passive
 python .\network_mapper.py --auto --vuln nse --confirm-vuln-scan
@@ -94,6 +95,7 @@ python3 network_mapper.py --subnet 192.168.20.0/24 --json --html-report
 python3 network_mapper.py --subnet 192.168.20.0/24 --top-ports 100 --timeout 2400
 python3 network_mapper.py --auto --detect-ip-conflicts
 python3 network_mapper.py --auto --debug-auto
+python3 network_mapper.py --auto --discover-routed-subnets
 python3 network_mapper.py --auto --known-topology known_topology.yml
 python3 network_mapper.py --auto --known-topology known_topology.yml --vuln passive
 python3 network_mapper.py --subnet 192.168.20.0/24 --vuln safe
@@ -169,6 +171,8 @@ python network_mapper.py --subnet 192.168.20.0/24 --detect-ip-conflicts --confli
 
 - `--auto` : détecte les sous-réseaux IPv4 privés de la machine locale. Sous Windows, PowerShell `Get-NetIPAddress -AddressFamily IPv4` est utilisé en priorité, avec fallback `ipconfig /all`.
 - `--debug-auto` : affiche les interfaces vues par la détection automatique et les réseaux conservés.
+- `--discover-routed-subnets` : ajoute une découverte heuristique des réseaux routés/amont via table de routes, passerelle par défaut et traceroute vers `1.1.1.1`/`8.8.8.8`. Les indices privés sont ramenés en candidats `/24`, validés par `nmap -sn`, et les candidats sans hôte actif sont rejetés.
+- `--hunt-private-subnets --confirm-wide-scan` : active explicitement un mode large sur les plages privées RFC1918 complètes. Sans cette confirmation, le script ne scanne jamais `10.0.0.0/8`, `172.16.0.0/12` ou `192.168.0.0/16` par défaut.
 - `--known-topology` : charge un YAML de topologie connue pour imposer noms, rôles, IP, MAC, VMID/CTID, bridges et interfaces. Ces données priment sur Nmap.
 - `--subnet` : ajoute un sous-réseau à scanner. L'option est répétable.
 - `--ports` : définit une liste de ports au format Nmap.
@@ -268,7 +272,7 @@ Pour une topologie physique fiable, il faut compléter Nmap avec SNMP, LLDP, CDP
 
 Nmap introuvable : vérifie `nmap --version` et redémarre le terminal après installation.
 
-Aucun sous-réseau avec `--auto` : relance avec `--debug-auto`. Sous Windows, vérifie que PowerShell peut exécuter `Get-NetIPAddress -AddressFamily IPv4`. Tu peux aussi préciser `--subnet` manuellement, par exemple `192.168.20.0/24`, ou fournir `--known-topology known_topology.yml`.
+Aucun sous-réseau avec `--auto` : relance avec `--debug-auto`. Sous Windows, vérifie que PowerShell peut exécuter `Get-NetIPAddress -AddressFamily IPv4`. Tu peux aussi préciser `--subnet` manuellement, par exemple `192.168.20.0/24`, fournir `--known-topology known_topology.yml`, ou essayer `--discover-routed-subnets` pour valider des candidats `/24` issus des routes et traceroutes.
 
 Scan OS en échec : relance avec `--skip-os`, ou démarre PowerShell en administrateur / utilise `sudo` sous Linux.
 

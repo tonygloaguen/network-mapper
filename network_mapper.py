@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -45,6 +45,7 @@ DEFAULT_VIRTUAL_SUBNETS = (
     ipaddress.IPv4Network("192.168.178.0/24"),
     ipaddress.IPv4Network("172.16.0.0/12"),
 )
+TRACEROUTE_TARGETS = ("1.1.1.1", "8.8.8.8")
 
 
 @dataclass
@@ -101,6 +102,12 @@ class AutoDetectedInterface:
     network: str = ""
     accepted: bool = False
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class RoutedSubnetDiscovery:
+    subnet: str
+    source: str
 
 
 @dataclass(frozen=True)
@@ -561,6 +568,222 @@ def parse_route_n_gateways(text: str) -> dict[str, str]:
         if len(parts) >= 8 and parts[0] in {"0.0.0.0", "default"}:
             gateways[parts[-1]] = parts[1]
     return gateways
+
+
+def private_ipv4_to_24(value: str) -> str:
+    try:
+        ip = ipaddress.IPv4Address(value)
+    except ValueError:
+        return ""
+    if not is_rfc1918_address(ip):
+        return ""
+    return str(ipaddress.IPv4Network(f"{ip}/24", strict=False))
+
+
+def private_network_to_24(value: str) -> str:
+    try:
+        net = ipaddress.IPv4Network(value, strict=False)
+    except ValueError:
+        return ""
+    if not is_rfc1918_network(net):
+        return ""
+    return str(ipaddress.IPv4Network(f"{net.network_address}/24", strict=False))
+
+
+def extract_private_ipv4_addresses(text: str) -> list[str]:
+    addresses: list[str] = []
+    for match in re.finditer(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text):
+        try:
+            ip = ipaddress.IPv4Address(match.group(0))
+        except ValueError:
+            continue
+        if is_rfc1918_address(ip):
+            addresses.append(str(ip))
+    return deduplicate(addresses)
+
+
+def parse_traceroute_candidate_subnets(text: str) -> list[str]:
+    return deduplicate(
+        subnet
+        for subnet in (private_ipv4_to_24(ip) for ip in extract_private_ipv4_addresses(text))
+        if subnet
+    )
+
+
+def parse_route_table_candidate_subnets(text: str) -> list[str]:
+    candidates: list[str] = []
+
+    for match in re.finditer(r"\b(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}\b", text):
+        subnet = private_network_to_24(match.group(0))
+        if subnet:
+            candidates.append(subnet)
+
+    lines = text.splitlines()
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                mask = ipaddress.IPv4Address(parts[1])
+                if parts[0] not in {"0.0.0.0", "default"}:
+                    network = ipaddress.IPv4Network(f"{parts[0]}/{mask_to_prefix(str(mask))}", strict=False)
+                    subnet = private_network_to_24(str(network))
+                    if subnet:
+                        candidates.append(subnet)
+            except ValueError:
+                pass
+
+    candidates.extend(
+        subnet
+        for subnet in (private_ipv4_to_24(ip) for ip in extract_private_ipv4_addresses(text))
+        if subnet
+    )
+    return deduplicate(candidates)
+
+
+def detect_route_table_texts(timeout: int = 30, *, log_file: Path | None = None) -> list[str]:
+    if platform.system().lower() == "windows":
+        proc = run_command(["route", "PRINT", "-4"], timeout=timeout, log_file=log_file)
+        return [proc.stdout]
+
+    texts: list[str] = []
+    ip_cmd = shutil.which("ip")
+    if ip_cmd:
+        proc = run_command([ip_cmd, "-4", "route", "show"], timeout=timeout, log_file=log_file)
+        texts.append(proc.stdout)
+
+    route_cmd = shutil.which("route")
+    if route_cmd:
+        proc = run_command([route_cmd, "-n"], timeout=timeout, log_file=log_file)
+        texts.append(proc.stdout)
+    return texts
+
+
+def traceroute_command(target: str) -> list[str]:
+    if platform.system().lower() == "windows":
+        tracert = shutil.which("tracert") or "tracert"
+        return [tracert, "-d", "-h", "8", "-w", "1000", target]
+    traceroute = shutil.which("traceroute") or "traceroute"
+    return [traceroute, "-n", "-m", "8", "-w", "2", target]
+
+
+def detect_traceroute_texts(
+    targets: Iterable[str] = TRACEROUTE_TARGETS,
+    *,
+    timeout: int = 30,
+    log_file: Path | None = None,
+) -> list[str]:
+    if platform.system().lower() != "windows" and not shutil.which("traceroute"):
+        return []
+
+    texts: list[str] = []
+    for target in targets:
+        try:
+            proc = run_command(traceroute_command(target), timeout=timeout, log_file=log_file)
+        except (OSError, RuntimeError):
+            continue
+        texts.append("\n".join(part for part in (proc.stdout, proc.stderr) if part))
+    return texts
+
+
+def collect_routed_subnet_candidates(
+    *,
+    route_texts: Iterable[str] = (),
+    traceroute_texts: Iterable[str] = (),
+    gateway_ips: Iterable[str] = (),
+    known_subnets: Iterable[str] = (),
+    exclude_virtual_subnets: bool = True,
+) -> dict[str, str]:
+    known = set(validate_subnets(known_subnets))
+    candidates: list[RoutedSubnetDiscovery] = []
+
+    for text in route_texts:
+        candidates.extend(
+            RoutedSubnetDiscovery(subnet, "local_route")
+            for subnet in parse_route_table_candidate_subnets(text)
+        )
+    candidates.extend(
+        RoutedSubnetDiscovery(subnet, "local_route")
+        for subnet in (private_ipv4_to_24(ip) for ip in gateway_ips)
+        if subnet
+    )
+    for text in traceroute_texts:
+        candidates.extend(
+            RoutedSubnetDiscovery(subnet, "traceroute_hint") for subnet in parse_traceroute_candidate_subnets(text)
+        )
+
+    selected: dict[str, str] = {}
+    for candidate in candidates:
+        valid = validate_subnets([candidate.subnet])
+        if not valid:
+            continue
+        subnet = valid[0]
+        if subnet in known:
+            continue
+        if exclude_virtual_subnets and is_default_virtual_subnet(subnet):
+            continue
+        selected.setdefault(subnet, candidate.source)
+    return selected
+
+
+def subnet_has_active_host(nmap: str, subnet: str, out_dir: Path, log_file: Path, timeout: int) -> bool:
+    out_xml = out_dir / f"routed_discovery_{safe_name(subnet)}.xml"
+    proc = run_command(build_discovery_command(nmap, subnet, out_xml), timeout=timeout, log_file=log_file)
+    if proc.returncode != 0:
+        print(f"[WARN] Découverte heuristique Nmap en échec sur {subnet}. Voir {log_file}")
+        return False
+    return bool(parse_nmap_xml(out_xml))
+
+
+def filter_active_routed_subnets(
+    candidate_sources: dict[str, str],
+    *,
+    nmap: str,
+    out_dir: Path,
+    log_file: Path,
+    timeout: int,
+    active_checker: Callable[[str], bool] | None = None,
+) -> dict[str, str]:
+    active: dict[str, str] = {}
+    checker = active_checker or (lambda subnet: subnet_has_active_host(nmap, subnet, out_dir, log_file, timeout))
+    for subnet, source in candidate_sources.items():
+        print(f"[INFO] Validation découverte routée : {subnet} ({source})")
+        if checker(subnet):
+            active[subnet] = source
+        else:
+            print(f"[INFO] Candidat rejeté, aucun hôte actif : {subnet}")
+    return active
+
+
+def discover_routed_subnets(
+    *,
+    nmap: str,
+    known_subnets: Iterable[str],
+    gateways: Iterable[str],
+    exclude_virtual_subnets: bool,
+    out_dir: Path,
+    log_file: Path,
+    timeout: int,
+) -> dict[str, str]:
+    probe_timeout = min(timeout, 30)
+    route_texts = detect_route_table_texts(timeout=probe_timeout, log_file=log_file)
+    traceroute_texts = detect_traceroute_texts(timeout=probe_timeout, log_file=log_file)
+    candidates = collect_routed_subnet_candidates(
+        route_texts=route_texts,
+        traceroute_texts=traceroute_texts,
+        gateway_ips=gateways,
+        known_subnets=known_subnets,
+        exclude_virtual_subnets=exclude_virtual_subnets,
+    )
+    if not candidates:
+        print("[INFO] Découverte routée : aucun candidat /24 privé nouveau.")
+        return {}
+    return filter_active_routed_subnets(
+        candidates,
+        nmap=nmap,
+        out_dir=out_dir,
+        log_file=log_file,
+        timeout=timeout,
+    )
 
 
 def deduplicate(values: Iterable[str]) -> list[str]:
@@ -1856,6 +2079,7 @@ def write_report(
     path: Path,
     *,
     mermaid_text: str,
+    subnet_sources: dict[str, str] | None = None,
 ) -> None:
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = build_markdown_report(
@@ -1865,6 +2089,7 @@ def write_report(
         conflicts,
         generated_at=now,
         mermaid_text=mermaid_text,
+        subnet_sources=subnet_sources,
     )
     path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -1877,6 +2102,7 @@ def build_markdown_report(
     *,
     generated_at: str,
     mermaid_text: str,
+    subnet_sources: dict[str, str] | None = None,
 ) -> list[str]:
     lines: list[str] = [
         "# Rapport de cartographie réseau",
@@ -1886,7 +2112,7 @@ def build_markdown_report(
         "## Sous-réseaux scannés",
         "",
     ]
-    lines.extend(f"- `{subnet}`" for subnet in subnets)
+    lines.extend(format_subnet_report_item(subnet, subnet_sources) for subnet in subnets)
     lines.extend(["", "## Passerelles détectées", ""])
     if gateways:
         lines.extend(f"- `{source}` -> `{gateway}`" for source, gateway in gateways.items())
@@ -1996,6 +2222,11 @@ def build_markdown_report(
     return lines
 
 
+def format_subnet_report_item(subnet: str, subnet_sources: dict[str, str] | None) -> str:
+    source = (subnet_sources or {}).get(subnet, "unknown")
+    return f"- `{subnet}` (source: `{source}`)"
+
+
 def sanitize_markdown_cell(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ")
 
@@ -2006,6 +2237,8 @@ def write_html_report(
     gateways: dict[str, str],
     conflicts: list[IpConflict],
     path: Path,
+    *,
+    subnet_sources: dict[str, str] | None = None,
 ) -> None:
     generated_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = "\n".join(
@@ -2020,7 +2253,11 @@ def write_html_report(
         "</tr>"
         for device in devices.values()
     )
-    subnet_items = "".join(f"<li><code>{html.escape(subnet)}</code></li>" for subnet in subnets)
+    subnet_items = "".join(
+        f"<li><code>{html.escape(subnet)}</code> "
+        f"<span>(source: <code>{html.escape((subnet_sources or {}).get(subnet, 'unknown'))}</code>)</span></li>"
+        for subnet in subnets
+    )
     gateway_items = (
         "".join(
             f"<li><code>{html.escape(source)}</code> -> <code>{html.escape(gateway)}</code></li>"
@@ -2099,7 +2336,7 @@ def write_html_report(
     path.write_text(document, encoding="utf-8")
 
 
-def validate_subnets(raw_subnets: Iterable[str]) -> list[str]:
+def validate_subnets(raw_subnets: Iterable[str], *, allow_wide_scan: bool = False) -> list[str]:
     valid: list[str] = []
     for raw in raw_subnets:
         try:
@@ -2108,7 +2345,7 @@ def validate_subnets(raw_subnets: Iterable[str]) -> list[str]:
             print(f"[WARN] Sous-réseau ignoré, format invalide : {raw}")
             continue
 
-        if net.prefixlen < MAX_PREFIX_WITHOUT_CONFIRMATION:
+        if net.prefixlen < MAX_PREFIX_WITHOUT_CONFIRMATION and not allow_wide_scan:
             print(
                 f"[WARN] Sous-réseau ignoré, trop large : {raw}. "
                 "Limite volontaire sans confirmation : /16 ou plus précis."
@@ -2123,21 +2360,69 @@ def validate_subnets(raw_subnets: Iterable[str]) -> list[str]:
     return deduplicate(valid)
 
 
+def add_subnet_sources(target: dict[str, str], subnets: Iterable[str], source: str) -> None:
+    for subnet in subnets:
+        target.setdefault(subnet, source)
+
+
+def resolve_scan_subnet_sources(
+    *,
+    auto_subnets: Iterable[str] = (),
+    explicit_subnets: Iterable[str] = (),
+    extra_subnets: Iterable[str] = (),
+    discovered_subnets: dict[str, str] | None = None,
+    known_subnets: Iterable[str] = (),
+    wide_private_subnets: Iterable[str] = (),
+    exclude_virtual_subnets: bool = True,
+    allow_wide_scan: bool = False,
+) -> dict[str, str]:
+    sources: dict[str, str] = {}
+
+    auto_valid = validate_subnets(auto_subnets)
+    if exclude_virtual_subnets:
+        auto_valid = [subnet for subnet in auto_valid if not is_default_virtual_subnet(subnet)]
+    add_subnet_sources(sources, auto_valid, "local_interface")
+
+    requested_valid = validate_subnets([*explicit_subnets, *extra_subnets])
+    add_subnet_sources(sources, requested_valid, "user_extra_subnet")
+
+    if discovered_subnets:
+        for subnet, source in discovered_subnets.items():
+            valid = validate_subnets([subnet])
+            if valid:
+                sources.setdefault(valid[0], source)
+
+    known_valid = validate_subnets(known_subnets)
+    add_subnet_sources(sources, known_valid, "known_topology")
+
+    wide_valid = validate_subnets(wide_private_subnets, allow_wide_scan=allow_wide_scan)
+    add_subnet_sources(sources, wide_valid, "user_extra_subnet")
+    return sources
+
+
 def resolve_scan_subnets(
     *,
     auto_subnets: Iterable[str] = (),
     explicit_subnets: Iterable[str] = (),
     extra_subnets: Iterable[str] = (),
+    discovered_subnets: dict[str, str] | None = None,
     known_subnets: Iterable[str] = (),
+    wide_private_subnets: Iterable[str] = (),
     exclude_virtual_subnets: bool = True,
+    allow_wide_scan: bool = False,
 ) -> list[str]:
-    auto_valid = validate_subnets(auto_subnets)
-    if exclude_virtual_subnets:
-        auto_valid = [subnet for subnet in auto_valid if not is_default_virtual_subnet(subnet)]
-
-    requested_valid = validate_subnets([*explicit_subnets, *extra_subnets])
-    known_valid = validate_subnets(known_subnets)
-    return deduplicate([*auto_valid, *requested_valid, *known_valid])
+    return list(
+        resolve_scan_subnet_sources(
+            auto_subnets=auto_subnets,
+            explicit_subnets=explicit_subnets,
+            extra_subnets=extra_subnets,
+            discovered_subnets=discovered_subnets,
+            known_subnets=known_subnets,
+            wide_private_subnets=wide_private_subnets,
+            exclude_virtual_subnets=exclude_virtual_subnets,
+            allow_wide_scan=allow_wide_scan,
+        )
+    )
 
 
 def positive_int(value: str) -> int:
@@ -2175,6 +2460,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--debug-auto",
         action="store_true",
         help="Affiche les interfaces détectées automatiquement et les réseaux retenus.",
+    )
+    parser.add_argument(
+        "--discover-routed-subnets",
+        action="store_true",
+        help=(
+            "Cherche passivement des sous-réseaux routés/amont via routes locales, passerelle "
+            "par défaut et traceroute, puis valide les candidats /24 avec nmap -sn."
+        ),
+    )
+    parser.add_argument(
+        "--hunt-private-subnets",
+        action="store_true",
+        help="Ajoute les plages privées RFC1918 complètes. Nécessite --confirm-wide-scan.",
+    )
+    parser.add_argument(
+        "--confirm-wide-scan",
+        action="store_true",
+        help="Confirmation explicite pour autoriser un scan très large avec --hunt-private-subnets.",
     )
     parser.add_argument(
         "--exclude-virtual-subnets",
@@ -2261,6 +2564,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.vuln == "nse" and not args.confirm_vuln_scan:
         parser.error("--vuln nse nécessite --confirm-vuln-scan")
+    if args.hunt_private_subnets and not args.confirm_wide_scan:
+        parser.error("--hunt-private-subnets nécessite --confirm-wide-scan")
 
     nmap = require_nmap()
     try:
@@ -2272,13 +2577,43 @@ def main(argv: list[str] | None = None) -> int:
     auto_subnets: list[str] = []
     if args.auto:
         auto_subnets = detect_local_networks(timeout=min(args.timeout, 30), debug_auto=args.debug_auto)
-    subnets = resolve_scan_subnets(
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_file = out_dir / "commands.log"
+    gateways = detect_default_gateways(timeout=min(args.timeout, 30))
+
+    base_subnets = resolve_scan_subnets(
         auto_subnets=auto_subnets,
         explicit_subnets=args.subnet,
         extra_subnets=args.extra_subnet,
         known_subnets=known_topology.networks,
         exclude_virtual_subnets=args.exclude_virtual_subnets,
     )
+    discovered_subnets: dict[str, str] = {}
+    if args.discover_routed_subnets:
+        discovered_subnets = discover_routed_subnets(
+            nmap=nmap,
+            known_subnets=base_subnets,
+            gateways=gateways.values(),
+            exclude_virtual_subnets=args.exclude_virtual_subnets,
+            out_dir=out_dir,
+            log_file=log_file,
+            timeout=args.timeout,
+        )
+
+    wide_private_subnets = [str(network) for network in RFC1918_NETWORKS] if args.hunt_private_subnets else []
+    subnet_sources = resolve_scan_subnet_sources(
+        auto_subnets=auto_subnets,
+        explicit_subnets=args.subnet,
+        extra_subnets=args.extra_subnet,
+        discovered_subnets=discovered_subnets,
+        known_subnets=known_topology.networks,
+        wide_private_subnets=wide_private_subnets,
+        exclude_virtual_subnets=args.exclude_virtual_subnets,
+        allow_wide_scan=args.confirm_wide_scan,
+    )
+    subnets = list(subnet_sources)
 
     if not subnets:
         print("Aucun sous-réseau à scanner.")
@@ -2287,10 +2622,6 @@ def main(argv: list[str] | None = None) -> int:
         print("  python .\\network_mapper.py --subnet 192.168.20.0/24")
         return 2
 
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    log_file = out_dir / "commands.log"
-    gateways = detect_default_gateways(timeout=min(args.timeout, 30))
     gateways.update(known_gateway_ips(known_topology))
     selected_ports = args.ports or DEFAULT_PORTS
 
@@ -2386,14 +2717,22 @@ def main(argv: list[str] | None = None) -> int:
         write_vulnerability_report(vulnerability_findings, vulnerabilities_report_path)
     write_mermaid(devices, subnets, gateways, mermaid_path, topology=known_topology)
     mermaid_text = mermaid_path.read_text(encoding="utf-8")
-    write_report(devices, subnets, gateways, ip_conflicts, report_path, mermaid_text=mermaid_text)
+    write_report(
+        devices,
+        subnets,
+        gateways,
+        ip_conflicts,
+        report_path,
+        mermaid_text=mermaid_text,
+        subnet_sources=subnet_sources,
+    )
 
     json_path = out_dir / "devices.json"
     html_path = out_dir / "report.html"
     if args.json:
         write_json(devices, ip_conflicts, json_path)
     if args.html_report:
-        write_html_report(devices, subnets, gateways, ip_conflicts, html_path)
+        write_html_report(devices, subnets, gateways, ip_conflicts, html_path, subnet_sources=subnet_sources)
 
     print("")
     print("[OK] Cartographie terminée.")
