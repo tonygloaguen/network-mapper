@@ -78,7 +78,6 @@ def test_virtual_subnets_are_excluded_from_auto_unless_requested() -> None:
     assert subnets == ["192.168.20.0/24", "192.168.56.0/24"]
 
 
-
 def test_traceroute_private_hop_produces_24_candidate() -> None:
     traceroute = """
 traceroute to 1.1.1.1 (1.1.1.1), 8 hops max

@@ -24,7 +24,7 @@ from pathlib import Path
 try:
     import yaml
 except ImportError:  # pragma: no cover - exercised only when optional dependency is absent
-    yaml = None
+    yaml = None  # type: ignore[assignment]
 
 DEFAULT_PORTS = (
     "21,22,23,25,53,67,68,80,110,123,135,137,138,139,143,161,162,389,443,"
@@ -604,9 +604,7 @@ def extract_private_ipv4_addresses(text: str) -> list[str]:
 
 def parse_traceroute_candidate_subnets(text: str) -> list[str]:
     return deduplicate(
-        subnet
-        for subnet in (private_ipv4_to_24(ip) for ip in extract_private_ipv4_addresses(text))
-        if subnet
+        subnet for subnet in (private_ipv4_to_24(ip) for ip in extract_private_ipv4_addresses(text)) if subnet
     )
 
 
@@ -633,9 +631,7 @@ def parse_route_table_candidate_subnets(text: str) -> list[str]:
                 pass
 
     candidates.extend(
-        subnet
-        for subnet in (private_ipv4_to_24(ip) for ip in extract_private_ipv4_addresses(text))
-        if subnet
+        subnet for subnet in (private_ipv4_to_24(ip) for ip in extract_private_ipv4_addresses(text)) if subnet
     )
     return deduplicate(candidates)
 
@@ -698,8 +694,7 @@ def collect_routed_subnet_candidates(
 
     for text in route_texts:
         candidates.extend(
-            RoutedSubnetDiscovery(subnet, "local_route")
-            for subnet in parse_route_table_candidate_subnets(text)
+            RoutedSubnetDiscovery(subnet, "local_route") for subnet in parse_route_table_candidate_subnets(text)
         )
     candidates.extend(
         RoutedSubnetDiscovery(subnet, "local_route")
