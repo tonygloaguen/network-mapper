@@ -20,11 +20,13 @@ import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
+yaml_module: Any | None
 try:
-    import yaml
+    import yaml as yaml_module
 except ImportError:  # pragma: no cover - exercised only when optional dependency is absent
-    yaml = None
+    yaml_module = None
 
 DEFAULT_PORTS = (
     "21,22,23,25,53,67,68,80,110,123,135,137,138,139,143,161,162,389,443,"
@@ -957,10 +959,10 @@ def parse_known_topology(data: object) -> KnownTopology:
 def load_known_topology(path: Path | None) -> KnownTopology:
     if path is None:
         return KnownTopology()
-    if yaml is None:
+    if yaml_module is None:
         raise RuntimeError("PyYAML est requis pour --known-topology. Installe le paquet 'PyYAML'.")
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data = yaml_module.safe_load(path.read_text(encoding="utf-8"))
     except OSError as exc:
         raise RuntimeError(f"Impossible de lire known_topology.yml : {exc}") from exc
     return parse_known_topology(data or {})
