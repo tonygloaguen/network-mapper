@@ -1,0 +1,68 @@
+name: One-shot Mypy YAML fix
+
+on:
+  push:
+    branches:
+      - fix/ruff-format
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: fix/ruff-format
+
+      - name: Patch optional YAML import
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("network_mapper.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''from dataclasses import asdict, dataclass, field
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ImportError:  # pragma: no cover - exercised only when optional dependency is absent
+              yaml = None
+          '''
+          new = '''from dataclasses import asdict, dataclass, field
+          from pathlib import Path
+          from typing import Any
+
+          yaml_module: Any | None
+          try:
+              import yaml as yaml_module
+          except ImportError:  # pragma: no cover - exercised only when optional dependency is absent
+              yaml_module = None
+          '''
+          if old not in text:
+              raise SystemExit("Expected YAML import block not found")
+          text = text.replace(old, new, 1)
+          text = text.replace("if yaml is None:", "if yaml_module is None:")
+          text = text.replace("data = yaml.safe_load(", "data = yaml_module.safe_load(")
+          path.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Ruff format patched file
+        run: ruff format network_mapper.py
+
+      - name: Commit patch
+        run: |
+          if git diff --quiet -- network_mapper.py; then
+            echo "No changes detected."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add network_mapper.py
+          git commit -m "Fix optional YAML import typing"
+          git push
