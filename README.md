@@ -30,6 +30,22 @@ Linux Fedora :
 sudo dnf install python3 python3-pip
 ```
 
+## Développement local
+
+Sous Debian/Ubuntu, crée un environnement virtuel pour éviter l'installation de paquets Python dans l'environnement système :
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-dev.txt
+
+ruff check .
+ruff format --check .
+mypy .
+pytest
+```
+
 ## Installation de Nmap
 
 Windows : installe Nmap depuis <https://nmap.org/download.html>. Redémarre PowerShell si le `PATH` a été modifié.
