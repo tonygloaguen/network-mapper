@@ -604,9 +604,7 @@ def extract_private_ipv4_addresses(text: str) -> list[str]:
 
 def parse_traceroute_candidate_subnets(text: str) -> list[str]:
     return deduplicate(
-        subnet
-        for subnet in (private_ipv4_to_24(ip) for ip in extract_private_ipv4_addresses(text))
-        if subnet
+        subnet for subnet in (private_ipv4_to_24(ip) for ip in extract_private_ipv4_addresses(text)) if subnet
     )
 
 
@@ -633,9 +631,7 @@ def parse_route_table_candidate_subnets(text: str) -> list[str]:
                 pass
 
     candidates.extend(
-        subnet
-        for subnet in (private_ipv4_to_24(ip) for ip in extract_private_ipv4_addresses(text))
-        if subnet
+        subnet for subnet in (private_ipv4_to_24(ip) for ip in extract_private_ipv4_addresses(text)) if subnet
     )
     return deduplicate(candidates)
 
@@ -698,8 +694,7 @@ def collect_routed_subnet_candidates(
 
     for text in route_texts:
         candidates.extend(
-            RoutedSubnetDiscovery(subnet, "local_route")
-            for subnet in parse_route_table_candidate_subnets(text)
+            RoutedSubnetDiscovery(subnet, "local_route") for subnet in parse_route_table_candidate_subnets(text)
         )
     candidates.extend(
         RoutedSubnetDiscovery(subnet, "local_route")
